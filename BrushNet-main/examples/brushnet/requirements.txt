@@ -1,0 +1,17 @@
+torchvision
+transformers==4.39.3
+huggingface-hub==0.25.2
+ftfy
+tensorboard
+datasets==2.19.1
+Pillow==9.5.0 
+opencv-python 
+imgaug 
+accelerate==0.20.3
+image-reward
+hpsv2
+torchmetrics
+open-clip-torch
+clip
+gradio==3.50.0
+segment_anything
