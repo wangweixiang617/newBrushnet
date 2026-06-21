@@ -1,0 +1,8 @@
+transformers==4.39.3
+huggingface-hub==0.25.2
+accelerate==0.20.3
+datasets==2.19.1
+fsspec==2024.3.1
+requests==2.31.0
+urllib3==1.26.20
+Pillow==9.5.0
