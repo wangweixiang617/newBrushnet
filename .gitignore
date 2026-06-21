@@ -1,0 +1,47 @@
+# Study
+d2l_study/
+python_study/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# PyCharm
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Logs and caches
+*.log
+.cache/
+pytest_cache/
+.pytest_cache/
+
+# Training outputs
+checkpoints/
+outputs/
+runs/
+wandb/
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Local datasets
+data/
+img/
+datasets/
+*.xlsx
