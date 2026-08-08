@@ -46,7 +46,7 @@ generator = torch.Generator("cuda").manual_seed(1234)
 image = pipe(
     caption, 
     init_image, 
-    mask_image, 
+    mask_image,
     num_inference_steps=50, 
     generator=generator,
     brushnet_conditioning_scale=brushnet_conditioning_scale
