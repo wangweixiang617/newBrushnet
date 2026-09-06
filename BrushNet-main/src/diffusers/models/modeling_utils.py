@@ -583,6 +583,14 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             user_agent=user_agent,
             **kwargs,
         )
+        # print('print(config)',config)
+        # print('print(unused_kwargs)', unused_kwargs)
+        # print('print(commit_hash)', commit_hash)
+        '''
+        print(config) {'_class_name': 'BrushNetModel', '_diffusers_version': '0.27.0.dev0', '_name_or_path': 'runs/logs/brushnet_segmask/checkpoint-550000', 'act_fn': 'silu', 'addition_embed_type': None, 'addition_embed_type_num_heads': 64, 'addition_time_embed_dim': None, 'attention_head_dim': 8, 'block_out_channels': [320, 640, 1280, 1280], 'brushnet_conditioning_channel_order': 'rgb', 'class_embed_type': None, 'conditioning_channels': 5, 'conditioning_embedding_out_channels': [16, 32, 96, 256], 'cross_attention_dim': 768, 'down_block_types': ['DownBlock2D', 'DownBlock2D', 'DownBlock2D', 'DownBlock2D'], 'downsample_padding': 1, 'encoder_hid_dim': None, 'encoder_hid_dim_type': None, 'flip_sin_to_cos': True, 'freq_shift': 0, 'global_pool_conditions': False, 'in_channels': 4, 'layers_per_block': 2, 'mid_block_scale_factor': 1, 'mid_block_type': 'MidBlock2D', 'norm_eps': 1e-05, 'norm_num_groups': 32, 'num_attention_heads': None, 'num_class_embeds': None, 'only_cross_attention': False, 'projection_class_embeddings_input_dim': None, 'resnet_time_scale_shift': 'default', 'transformer_layers_per_block': 1, 'up_block_types': ['UpBlock2D', 'UpBlock2D', 'UpBlock2D', 'UpBlock2D'], 'upcast_attention': False, 'use_linear_projection': False}
+        print(unused_kwargs) {'device_map': None, 'max_memory': None, 'offload_folder': None, 'offload_state_dict': False}
+        print(commit_hash) None
+        '''
 
         # load model
         model_file = None
