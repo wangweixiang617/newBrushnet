@@ -19,8 +19,7 @@ from tqdm.auto import tqdm
 #   (配置名称, Baostock代码)
 # 第三个字段即使存在也不会用于最终名称。
 # 最终显示名称和 Excel Sheet 名称优先使用 Baostock 远程返回的证券名称。
-ETF_CONFIG = [
-    ("有色金属ETF", "sh.512400"),
+ETF_CONFIG1 = [
     ("科创50ETF", "sh.588000"),
     ("中证银行ETF", "sh.512800"),
     # ("黄金ETF", "sh.518880"),
@@ -30,7 +29,7 @@ ETF_CONFIG = [
     # ("新能电池ETF", "sz.159755"),
     # ("电网设备ETF", "sz.159326"),
 ]
-ETF_CONFIG2 = [
+ETF_CONFIG = [
     ("中概互联ETF", "sz.159605"),
     ("中概互联网ETF", "sh.513050"),
     ("港股通科技30ETF", "sz.159636"),
@@ -170,14 +169,6 @@ ETF_CONFIG2 = [
 # 表格导入配置：由上传 CSV 的“名称/代码”列转换而来。
 # 说明：6/5/9 开头按 sh，0/1/2/3 开头且 6 位按 sz，5 位数字按 hk。
 ETF_CONFIG3 = [
-    ("协创数据", "sz.300857"),
-    ("东鹏饮料", "sh.605499"),
-    ("宇树科技", "sh.688836"),
-    ("中兴通讯", "sz.000063"),
-    ("阳光电源", "sz.300274"),
-    ("寒武纪", "sh.688256"),
-    ("迈瑞医疗", "sz.300760"),
-    ("恒立液压", "sh.601100"),
     ("英维克", "sz.002837"),
     ("润泽科技", "sz.300442"),
     ("金山办公", "sh.688111"),
@@ -206,6 +197,8 @@ ETF_CONFIG3 = [
     ("亿纬锂能", "sz.300014"),
     ("特变电工", "sh.600089"),
     ("思源电气", "sz.002028"),
+    ("平高电气", "sh.60ß0312"),
+    ("潍柴动力", "sz.000338"),
     ("赣锋锂业", "sz.002460"),
     ("天齐锂业", "sz.002466"),
     ("中宠股份", "sz.002891"),
@@ -292,6 +285,12 @@ KDJ_K_SMOOTH = 3
 KDJ_D_SMOOTH = 3
 KDJ_INITIAL_VALUE = 50.0
 
+# 年化波动率计算配置：
+# 使用前复权 close 的日收益率，最多取最近 250 个日收益率；
+# 如果可用日收益率不足 250 个，则使用全部可用日收益率。
+VOLATILITY_LOOKBACK_TRADING_DAYS = 250
+VOLATILITY_ANNUALIZATION_TRADING_DAYS = 250
+
 # ========================== 网络超时与重试配置 ==========================
 # 每一次 Baostock 完整处理最多等待 30 秒。超时后会强制结束子进程，
 # 因此即使远程接口永久不返回，也不会卡住整个任务。
@@ -360,6 +359,58 @@ def format_number(value: object, digits: int = 6) -> str:
         return f"{float(value):.{digits}f}"
     except (TypeError, ValueError):
         return "NA"
+
+
+def format_percent(value: object, digits: int = 2) -> str:
+    """将百分比数值格式化为带 % 的字符串。"""
+    number_text = format_number(value, digits=digits)
+    return "NA" if number_text == "NA" else f"{number_text}%"
+
+
+def calculate_recent_annualized_volatility(
+    df: pd.DataFrame,
+    close_col: str = "close",
+    lookback_days: int = VOLATILITY_LOOKBACK_TRADING_DAYS,
+    annualization_days: int = VOLATILITY_ANNUALIZATION_TRADING_DAYS,
+) -> Tuple[float, int]:
+    """
+    计算最新年化波动率。
+
+    计算方式：
+      1. 使用前复权 close 计算日收益率；
+      2. 最多取最近 lookback_days 个日收益率；
+      3. 如果可用日收益率不足 lookback_days 个，则使用全部可用日收益率；
+      4. 日收益率标准差乘以 sqrt(annualization_days)，并转换为百分比。
+
+    返回：
+      annualized_volatility_pct:
+          年化波动率百分比数值，例如 28.5 表示 28.5%。
+      sample_count:
+          实际参与计算的日收益率条数。
+    """
+    if close_col not in df.columns:
+        return float("nan"), 0
+
+    close = pd.to_numeric(df[close_col], errors="coerce").dropna()
+    returns = close.pct_change(fill_method=None).dropna()
+    recent_returns = returns.tail(int(lookback_days))
+
+    sample_count = int(len(recent_returns))
+    if sample_count == 0:
+        return float("nan"), 0
+
+    if sample_count == 1:
+        daily_std = 0.0
+    else:
+        daily_std = float(recent_returns.std(ddof=1))
+
+    if not math.isfinite(daily_std):
+        return float("nan"), sample_count
+
+    annualized_volatility_pct = (
+        daily_std * math.sqrt(float(annualization_days)) * 100.0
+    )
+    return float(annualized_volatility_pct), sample_count
 
 
 def make_unique_sheet_name(raw_name: str, used_names: set) -> str:
@@ -537,6 +588,30 @@ def apply_summary_cross_color_format(
                             worksheet.cell(row=excel_row, column=excel_column),
                             forecast_signal,
                         )
+
+
+def apply_summary_number_format(
+    writer: pd.ExcelWriter,
+    sheet_name: str,
+    column_formats: Dict[str, str],
+) -> None:
+    """按表头名称设置汇总 Sheet 的数字格式。"""
+    worksheet = writer.sheets[sheet_name]
+    header_to_column = {
+        cell.value: cell.column
+        for cell in worksheet[1]
+        if cell.value is not None
+    }
+
+    for column_name, number_format in column_formats.items():
+        excel_column = header_to_column.get(column_name)
+        if excel_column is None:
+            continue
+
+        for excel_row in range(2, worksheet.max_row + 1):
+            worksheet.cell(row=excel_row, column=excel_column).number_format = (
+                number_format
+            )
 
 
 def apply_detail_cross_color_format(
@@ -1366,12 +1441,27 @@ def get_etf_full_data(code: str, configured_name: str) -> Optional[pd.DataFrame]
         df.attrs["name_match"] = bool(remote_name) and name_match
         df.attrs["name_verified"] = bool(remote_name)
 
+        annualized_volatility_pct, volatility_sample_count = (
+            calculate_recent_annualized_volatility(df)
+        )
+        df.attrs["annualized_volatility_pct"] = annualized_volatility_pct
+        df.attrs["volatility_sample_count"] = volatility_sample_count
+        df.attrs["volatility_lookback_days"] = VOLATILITY_LOOKBACK_TRADING_DAYS
+        df.attrs["volatility_annualization_days"] = (
+            VOLATILITY_ANNUALIZATION_TRADING_DAYS
+        )
+
         latest = df.iloc[-1]
         rate = (latest["close"] / df["close"].iloc[0] - 1) * 100
 
         print(f"\n{display_name}（{code}）处理完成")
         print(f"总数据条数：{len(df)}")
         print(f"累计涨跌幅：{rate:.2f}%")
+        print(
+            f"最新年化波动率：{format_percent(annualized_volatility_pct)}"
+            f"（最近最多 {VOLATILITY_LOOKBACK_TRADING_DAYS} 个日收益率，"
+            f"实际样本数：{volatility_sample_count}）"
+        )
         print(f"最新日期：{latest['date'].strftime('%Y-%m-%d')}")
         print(
             "日线 MACD 数值："
@@ -1476,6 +1566,8 @@ def build_summary_row(df: pd.DataFrame) -> Dict[str, object]:
         "起始日期": df["date"].iloc[0].strftime("%Y-%m-%d"),
         "最新日期": latest["date"].strftime("%Y-%m-%d"),
         "数据条数": len(df),
+        "最新年化波动率(%)": df.attrs.get("annualized_volatility_pct", pd.NA),
+        "波动率样本收益率数": int(df.attrs.get("volatility_sample_count", 0)),
         "日MACD水上水下状态": latest["day_macd_water_status"],
         "日MACD当前": status_text(latest["day_macd_status"]),
         "日MACD交叉事件": latest["day_macd_cross_event_text"],
@@ -2033,6 +2125,8 @@ def _run_main(program_start_perf: float) -> None:
             "证券代码",
             "名称校验",
             "最新日期",
+            "最新年化波动率(%)",
+            "波动率样本收益率数",
             "日MACD水上水下状态",
             "日MACD当前",
             "日MACD已持续交易日",
@@ -2050,6 +2144,12 @@ def _run_main(program_start_perf: float) -> None:
         ]
 
         console_summary_df = summary_df[display_columns].copy()
+        if "最新年化波动率(%)" in console_summary_df.columns:
+            console_summary_df["最新年化波动率(%)"] = [
+                format_number(value, digits=2)
+                for value in console_summary_df["最新年化波动率(%)"]
+            ]
+
         marker_pairs = {
             "日MACD当前": "日MACD已持续交易日",
             "日KDJ当前": "日KDJ已持续交易日",
@@ -2095,6 +2195,13 @@ def _run_main(program_start_perf: float) -> None:
                 writer,
                 summary_df,
                 sheet_name="汇总",
+            )
+            apply_summary_number_format(
+                writer,
+                sheet_name="汇总",
+                column_formats={
+                    "最新年化波动率(%)": "0.00",
+                },
             )
         else:
             pd.DataFrame(
@@ -2170,6 +2277,12 @@ def _run_main(program_start_perf: float) -> None:
     print(
         "超时保护说明：每次远程处理都在独立子进程中运行；"
         "超过 30 秒会被强制结束，不会无限卡住主任务。"
+    )
+    print(
+        "年化波动率说明：使用前复权收盘价的日收益率，最多取最近 "
+        f"{VOLATILITY_LOOKBACK_TRADING_DAYS} 个日收益率；"
+        "不足时使用全部可用日收益率；"
+        f"按 sqrt({VOLATILITY_ANNUALIZATION_TRADING_DAYS}) 年化后以百分比输出。"
     )
     print("注意：当本周尚未结束时，周线指标和下一周预测会随本周后续行情变化。")
 
