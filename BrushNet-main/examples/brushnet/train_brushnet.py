@@ -47,6 +47,7 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
+from validation_evaluator import BrushNetValidationEvaluator
 
 if is_wandb_available():
     import wandb
@@ -67,7 +68,375 @@ def image_grid(imgs, rows, cols):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
 
+def log_validation_evaluator(
+    vae,
+    text_encoder,
+    tokenizer,
+    unet,
+    brushnet,
+    args,
+    accelerator,
+    weight_dtype,
+    step,
+    validation_evaluator=None,
+    is_final_validation=False,
+):
+    logger.info("Running validation...")
 
+    # ==========================================
+    # 当前 BrushNet
+    # ==========================================
+
+    if not is_final_validation:
+        brushnet = accelerator.unwrap_model(brushnet)
+    else:
+        brushnet = BrushNetModel.from_pretrained(
+            args.output_dir,
+            torch_dtype=weight_dtype,
+        )
+
+    # ==========================================
+    # Validation pipeline
+    # ==========================================
+
+    pipeline = StableDiffusionBrushNetPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        unet=unet,
+        brushnet=brushnet,
+
+        # validation 不启用 safety checker
+        safety_checker=None,
+        feature_extractor=None,
+        requires_safety_checker=False,
+
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=weight_dtype,
+    )
+
+    pipeline.scheduler = UniPCMultistepScheduler.from_config(
+        pipeline.scheduler.config
+    )
+
+    pipeline = pipeline.to(accelerator.device)
+
+    pipeline.set_progress_bar_config(
+        disable=True
+    )
+
+    if args.enable_xformers_memory_efficient_attention:
+        pipeline.enable_xformers_memory_efficient_attention()
+
+    # ==========================================
+    # Generator
+    # ==========================================
+
+    if args.seed is None:
+        generator = None
+    else:
+        generator = torch.Generator(
+            device=accelerator.device
+        ).manual_seed(args.seed)
+
+    # ==========================================
+    # Validation data
+    # ==========================================
+
+    if (
+        len(args.validation_image)
+        == len(args.validation_prompt)
+        == len(args.validation_mask)
+    ):
+        validation_images = args.validation_image
+        validation_prompts = args.validation_prompt
+        validation_masks = args.validation_mask
+    else:
+        raise ValueError(
+            "The number of validation_image, "
+            "validation_prompt and "
+            "validation_mask must match."
+        )
+
+    image_logs = []
+
+    # 保存给 evaluator
+    metric_samples = []
+
+    inference_ctx = (
+        contextlib.nullcontext()
+        if is_final_validation
+        else torch.autocast("cuda")
+    )
+
+    # ==========================================
+    # Generate
+    # ==========================================
+
+    for (
+        validation_prompt,
+        validation_image_path,
+        validation_mask_path,
+    ) in zip(
+        validation_prompts,
+        validation_images,
+        validation_masks,
+    ):
+
+        # ------------------------------
+        # GT 原图：必须保留
+        # ------------------------------
+
+        gt_image = Image.open(
+            validation_image_path
+        ).convert("RGB")
+
+        mask_image = Image.open(
+            validation_mask_path
+        ).convert("RGB")
+
+        # ------------------------------
+        # BrushNet conditioning
+        # ------------------------------
+
+        conditioning_image = Image.composite(
+            Image.new(
+                "RGB",
+                gt_image.size,
+                (0, 0, 0),
+            ),
+            gt_image,
+            mask_image.convert("L"),
+        )
+
+        images = []
+
+        for _ in range(args.num_validation_images):
+
+            with inference_ctx:
+
+                generated_image = pipeline(
+                    validation_prompt,
+                    conditioning_image,
+                    mask_image,
+                    num_inference_steps=20,
+                    generator=generator,
+                ).images[0]
+
+            images.append(generated_image)
+
+            if validation_evaluator is not None:
+                metric_samples.append(
+                    {
+                        "gt_image": gt_image.copy(),
+                        "pred_image": generated_image.copy(),
+                        "mask_image": mask_image.copy(),
+                        "prompt": validation_prompt,
+                    }
+                )
+
+        image_logs.append(
+            {
+                "validation_image": conditioning_image,
+                "images": images,
+                "validation_prompt": validation_prompt,
+            }
+        )
+
+    # ==========================================
+    # 非常重要：
+    # Metric 之前删除 validation pipeline
+    # ==========================================
+
+    del pipeline
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # ==========================================
+    # Metrics
+    # ==========================================
+
+    validation_metrics = None
+
+    if (
+        validation_evaluator is not None
+        and len(metric_samples) > 0
+    ):
+
+        # final validation 一定 full
+        run_full_metrics = is_final_validation
+
+        # 训练中每 N step full
+        if (
+            not run_full_metrics
+            and args.full_validation_metric_steps is not None
+            and args.full_validation_metric_steps > 0
+            and step % args.full_validation_metric_steps == 0
+        ):
+            run_full_metrics = True
+
+        validation_evaluator.print_cuda_memory(
+            "before metrics"
+        )
+
+        validation_metrics = validation_evaluator.evaluate_batch(
+            metric_samples,
+            full=run_full_metrics,
+        )
+
+        validation_evaluator.print_cuda_memory(
+            "after metrics"
+        )
+
+        metric_string = ", ".join(
+            [
+                f"{k}={v:.6f}"
+                for k, v in validation_metrics.items()
+            ]
+        )
+
+        logger.info(
+            f"Validation metrics "
+            f"at step {step}: "
+            f"{metric_string}"
+        )
+
+    # ==========================================
+    # TensorBoard / WandB
+    # ==========================================
+
+    tracker_key = (
+        "test"
+        if is_final_validation
+        else "validation"
+    )
+
+    for tracker in accelerator.trackers:
+
+        if tracker.name == "tensorboard":
+
+            # --------------------------
+            # Images
+            # --------------------------
+
+            for log in image_logs:
+
+                images = log["images"]
+
+                validation_prompt = log[
+                    "validation_prompt"
+                ]
+
+                validation_image = log[
+                    "validation_image"
+                ]
+
+                formatted_images = [
+                    np.asarray(validation_image)
+                ]
+
+                for image in images:
+                    formatted_images.append(
+                        np.asarray(image)
+                    )
+
+                formatted_images = np.stack(
+                    formatted_images
+                )
+
+                tracker.writer.add_images(
+                    validation_prompt,
+                    formatted_images,
+                    step,
+                    dataformats="NHWC",
+                )
+
+            # --------------------------
+            # Metrics
+            # --------------------------
+
+            if validation_metrics is not None:
+
+                validation_evaluator.log_tensorboard(
+                    writer=tracker.writer,
+                    metrics=validation_metrics,
+                    step=step,
+                    prefix=tracker_key,
+                )
+
+        elif tracker.name == "wandb":
+
+            formatted_images = []
+
+            for log in image_logs:
+
+                images = log["images"]
+
+                validation_prompt = log[
+                    "validation_prompt"
+                ]
+
+                validation_image = log[
+                    "validation_image"
+                ]
+
+                formatted_images.append(
+                    wandb.Image(
+                        validation_image,
+                        caption="BrushNet conditioning",
+                    )
+                )
+
+                for image in images:
+
+                    formatted_images.append(
+                        wandb.Image(
+                            image,
+                            caption=validation_prompt,
+                        )
+                    )
+
+            tracker.log(
+                {
+                    tracker_key: formatted_images
+                },
+                step=step,
+            )
+
+            if validation_metrics is not None:
+
+                tracker.log(
+                    {
+                        f"{tracker_key}/{k}": v
+                        for k, v
+                        in validation_metrics.items()
+                    },
+                    step=step,
+                )
+
+        else:
+            logger.warning(
+                "Image logging not implemented "
+                f"for {tracker.name}"
+            )
+
+    # ==========================================
+    # 清理 CPU validation temporary objects
+    # ==========================================
+
+    metric_samples.clear()
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return image_logs
 def log_validation(
     vae, text_encoder, tokenizer, unet, brushnet, args, accelerator, weight_dtype, step, is_final_validation=False
 ):
@@ -289,7 +658,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resolution",
         type=int,
-        default=512,
+        default=1234,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
@@ -569,6 +938,31 @@ def parse_args(input_args=None):
         help=(
             "Training BrushNet with random mask"
         ),
+    )
+    parser.add_argument(
+        "--enable_validation_metrics",
+        action="store_true",
+        help=(
+            "Calculate PSNR/LPIPS/MSE "
+            "during validation."
+        ),
+    )
+
+    parser.add_argument(
+        "--full_validation_metric_steps",
+        type=int,
+        default=5000,
+        help=(
+            "Calculate all 7 metrics every N "
+            "optimization steps. "
+            "0 means never during training."
+        ),
+    )
+
+    parser.add_argument(
+        "--validation_metric_ckpt_path",
+        type=str,
+        default="data/ckpt",
     )
 
     if input_args is not None:
@@ -1165,7 +1559,7 @@ def main(args):
     text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(train_dataloader_len / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(train_dataloader_len / accelerator.num_processes / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
@@ -1184,6 +1578,16 @@ def main(args):
 
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
+    validation_evaluator = None
+    if (accelerator.is_main_process and args.enable_validation_metrics):
+        validation_evaluator = (
+            BrushNetValidationEvaluator(
+                device=accelerator.device,
+                ckpt_path=args.validation_metric_ckpt_path,
+                offload=True,
+            )
+        )
+        logger.info("Validation evaluator initialized.")
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -1340,7 +1744,7 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
-                        image_logs = log_validation(
+                        image_logs = log_validation_evaluator(
                             vae,
                             text_encoder,
                             tokenizer,
@@ -1350,6 +1754,7 @@ def main(args):
                             accelerator,
                             weight_dtype,
                             global_step,
+                            validation_evaluator=validation_evaluator,
                         )
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
@@ -1368,7 +1773,7 @@ def main(args):
         # Run a final round of validation.
         image_logs = None
         if args.validation_prompt is not None:
-            image_logs = log_validation(
+            image_logs = log_validation_evaluator(
                 vae=vae,
                 text_encoder=text_encoder,
                 tokenizer=tokenizer,
@@ -1378,7 +1783,8 @@ def main(args):
                 accelerator=accelerator,
                 weight_dtype=weight_dtype,
                 step=global_step,
-                is_final_validation=True,
+                validation_evaluator=validation_evaluator,
+                is_final_validation=True
             )
 
         if args.push_to_hub:
@@ -1394,6 +1800,21 @@ def main(args):
                 commit_message="End of training",
                 ignore_patterns=["step_*", "epoch_*"],
             )
+
+    if (
+            accelerator.is_main_process
+            and
+            validation_evaluator
+            is not None
+    ):
+        validation_evaluator.close()
+
+    validation_evaluator = None
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     accelerator.end_training()
 

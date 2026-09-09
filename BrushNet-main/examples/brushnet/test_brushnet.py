@@ -6,10 +6,12 @@ from PIL import Image
 
 # choose the base model here
 base_model_path = "data/ckpt/realisticVisionV60B1_v51VAE"
+# base_model_path = "../../data/ckpt/realisticVisionV60B1_v51VAE"
 # base_model_path = "runwayml/stable-diffusion-v1-5"
 
 # input brushnet ckpt path
 brushnet_path = "data/ckpt/segmentation_mask_brushnet_ckpt"
+# brushnet_path = "../../data/ckpt/segmentation_mask_brushnet_ckpt"
 
 # choose whether using blended operation
 blended = False
@@ -17,6 +19,9 @@ blended = False
 # input source image / mask image path and the text prompt
 image_path="examples/brushnet/src/test_image.jpg"
 mask_path="examples/brushnet/src/test_mask.jpg"
+# image_path="../../examples/brushnet/src/test_image.jpg"
+# mask_path="../../examples/brushnet/src/test_mask.jpg"
+
 caption="A cake on the table."
 
 # conditioning scale
@@ -67,3 +72,50 @@ if blended:
     image=Image.fromarray(image_pasted)
 
 image.save("output.png")
+from validation_evaluator import BrushNetValidationEvaluator
+device = "cuda" if torch.cuda.is_available() else "cpu"
+evaluator = BrushNetValidationEvaluator(
+    device=device,
+    # ckpt_path="../../data/ckpt",
+    ckpt_path="data/ckpt",
+    hps_batch_size=1,
+    offload=True,
+)
+try:
+    print("===== Before evaluation =====")
+    evaluator.print_devices()
+    evaluator.print_cuda_memory("before")
+
+    print("\n===== Light evaluation =====")
+
+    light_result = evaluator.evaluate(
+        gt_image=init_image,
+        pred_image=image,
+        mask_image=mask_image,
+        full=False,
+    )
+
+    print(light_result)
+
+    print("\n===== After light evaluation =====")
+    evaluator.print_devices()
+    evaluator.print_cuda_memory("after light")
+
+    print("\n===== Full evaluation =====")
+
+    full_result = evaluator.evaluate(
+        gt_image=init_image,
+        pred_image=image,
+        mask_image=mask_image,
+        prompt=caption,
+        full=True,
+    )
+
+    print(full_result)
+
+    print("\n===== After full evaluation =====")
+    evaluator.print_devices()
+    evaluator.print_cuda_memory("after full")
+
+finally:
+    evaluator.close()
