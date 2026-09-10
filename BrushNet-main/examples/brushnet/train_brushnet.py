@@ -56,7 +56,7 @@ if is_wandb_available():
 check_min_version("0.27.0.dev0")
 
 logger = get_logger(__name__)
-
+VALIDATIONCOUNTMAX: int = 8 #验证集最大数量
 
 def image_grid(imgs, rows, cols):
     assert len(imgs) == rows * cols
@@ -83,22 +83,13 @@ def log_validation_evaluator(
 ):
     logger.info("Running validation...")
 
-    # ==========================================
     # 当前 BrushNet
-    # ==========================================
-
     if not is_final_validation:
         brushnet = accelerator.unwrap_model(brushnet)
     else:
-        brushnet = BrushNetModel.from_pretrained(
-            args.output_dir,
-            torch_dtype=weight_dtype,
-        )
+        brushnet = BrushNetModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
 
-    # ==========================================
     # Validation pipeline
-    # ==========================================
-
     pipeline = StableDiffusionBrushNetPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=vae,
@@ -106,109 +97,50 @@ def log_validation_evaluator(
         tokenizer=tokenizer,
         unet=unet,
         brushnet=brushnet,
-
-        # validation 不启用 safety checker
         safety_checker=None,
         feature_extractor=None,
         requires_safety_checker=False,
-
         revision=args.revision,
         variant=args.variant,
         torch_dtype=weight_dtype,
     )
-
-    pipeline.scheduler = UniPCMultistepScheduler.from_config(
-        pipeline.scheduler.config
-    )
-
+    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
     pipeline = pipeline.to(accelerator.device)
-
-    pipeline.set_progress_bar_config(
-        disable=True
-    )
+    # pipeline.set_progress_bar_config(disable=True)
 
     if args.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
 
-    # ==========================================
-    # Generator
-    # ==========================================
-
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.Generator(
-            device=accelerator.device
-        ).manual_seed(args.seed)
-
+    # Validation 固定 seed，便于不同 checkpoint 对比
     generator = torch.Generator(device=accelerator.device).manual_seed(1234)
 
-    # ==========================================
     # Validation data
-    # ==========================================
-
-    if (
-        len(args.validation_image)
-        == len(args.validation_prompt)
-        == len(args.validation_mask)
-    ):
+    if len(args.validation_image) == len(args.validation_prompt) == len(args.validation_mask):
         validation_images = args.validation_image
         validation_prompts = args.validation_prompt
         validation_masks = args.validation_mask
     else:
-        raise ValueError(
-            "The number of validation_image, "
-            "validation_prompt and "
-            "validation_mask must match."
-        )
+        raise ValueError("The number of validation_image, validation_prompt and validation_mask must match.")
 
     image_logs = []
-
-    # 保存给 evaluator
     metric_samples = []
+    inference_ctx = contextlib.nullcontext() if is_final_validation else torch.autocast("cuda")
 
-    inference_ctx = (
-        contextlib.nullcontext()
-        if is_final_validation
-        else torch.autocast("cuda")
-    )
-
-    # ==========================================
+    validation_count = 0
     # Generate
-    # ==========================================
-
-    for (
-        validation_prompt,
-        validation_image_path,
-        validation_mask_path,
-    ) in zip(
-        validation_prompts,
-        validation_images,
-        validation_masks,
+    for validation_prompt, validation_image_path, validation_mask_path in zip(
+        validation_prompts, validation_images, validation_masks
     ):
+        validation_count = validation_count + 1
+        if validation_count > VALIDATIONCOUNTMAX:
+            break
+        # GT 原图必须保留，用于 PSNR / LPIPS / MSE
+        gt_image = Image.open(validation_image_path).convert("RGB")
+        mask_image = Image.open(validation_mask_path).convert("RGB")
 
-        # ------------------------------
-        # GT 原图：必须保留
-        # ------------------------------
-
-        gt_image = Image.open(
-            validation_image_path
-        ).convert("RGB")
-
-        mask_image = Image.open(
-            validation_mask_path
-        ).convert("RGB")
-
-        # ------------------------------
-        # BrushNet conditioning
-        # ------------------------------
-
+        # 白色 mask 区域变黑，生成 BrushNet conditioning image
         conditioning_image = Image.composite(
-            Image.new(
-                "RGB",
-                gt_image.size,
-                (0, 0, 0),
-            ),
+            Image.new("RGB", gt_image.size, (0, 0, 0)),
             gt_image,
             mask_image.convert("L"),
         )
@@ -216,9 +148,7 @@ def log_validation_evaluator(
         images = []
 
         for _ in range(args.num_validation_images):
-
             with inference_ctx:
-
                 generated_image = pipeline(
                     validation_prompt,
                     conditioning_image,
@@ -247,33 +177,20 @@ def log_validation_evaluator(
             }
         )
 
-    # ==========================================
-    # 非常重要：
-    # Metric 之前删除 validation pipeline
-    # ==========================================
-
+    # Metric 前删除 validation pipeline，释放显存
     del pipeline
-
     gc.collect()
-
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # ==========================================
     # Metrics
-    # ==========================================
-
     validation_metrics = None
 
-    if (
-        validation_evaluator is not None
-        and len(metric_samples) > 0
-    ):
-
-        # final validation 一定 full
+    if validation_evaluator is not None and len(metric_samples) > 0:
+        # final validation 一定计算完整 7 个指标
         run_full_metrics = is_final_validation
 
-        # 训练中每 N step full
+        # 训练中每 N step 计算完整指标
         if (
             not run_full_metrics
             and args.full_validation_metric_steps is not None
@@ -282,74 +199,27 @@ def log_validation_evaluator(
         ):
             run_full_metrics = True
 
-        validation_evaluator.print_cuda_memory(
-            "before metrics"
-        )
+        validation_evaluator.print_cuda_memory("before metrics")
+        validation_metrics = validation_evaluator.evaluate_batch(metric_samples, full=run_full_metrics)
+        validation_evaluator.print_cuda_memory("after metrics")
 
-        validation_metrics = validation_evaluator.evaluate_batch(
-            metric_samples,
-            full=run_full_metrics,
-        )
+        metric_string = ", ".join(f"{k}={v:.6f}" for k, v in validation_metrics.items())
+        logger.info(f"Validation metrics at step {step}: {metric_string}")
 
-        validation_evaluator.print_cuda_memory(
-            "after metrics"
-        )
-
-        metric_string = ", ".join(
-            [
-                f"{k}={v:.6f}"
-                for k, v in validation_metrics.items()
-            ]
-        )
-
-        logger.info(
-            f"Validation metrics "
-            f"at step {step}: "
-            f"{metric_string}"
-        )
-
-    # ==========================================
     # TensorBoard / WandB
-    # ==========================================
-
-    tracker_key = (
-        "test"
-        if is_final_validation
-        else "validation"
-    )
+    tracker_key = "test" if is_final_validation else "validation"
 
     for tracker in accelerator.trackers:
-
         if tracker.name == "tensorboard":
-
-            # --------------------------
             # Images
-            # --------------------------
-
             for log in image_logs:
-
                 images = log["images"]
+                validation_prompt = log["validation_prompt"]
+                validation_image = log["validation_image"]
 
-                validation_prompt = log[
-                    "validation_prompt"
-                ]
-
-                validation_image = log[
-                    "validation_image"
-                ]
-
-                formatted_images = [
-                    np.asarray(validation_image)
-                ]
-
-                for image in images:
-                    formatted_images.append(
-                        np.asarray(image)
-                    )
-
-                formatted_images = np.stack(
-                    formatted_images
-                )
+                formatted_images = [np.asarray(validation_image)]
+                formatted_images.extend(np.asarray(image) for image in images)
+                formatted_images = np.stack(formatted_images)
 
                 tracker.writer.add_images(
                     validation_prompt,
@@ -358,12 +228,8 @@ def log_validation_evaluator(
                     dataformats="NHWC",
                 )
 
-            # --------------------------
             # Metrics
-            # --------------------------
-
             if validation_metrics is not None:
-
                 validation_evaluator.log_tensorboard(
                     writer=tracker.writer,
                     metrics=validation_metrics,
@@ -372,73 +238,41 @@ def log_validation_evaluator(
                 )
 
         elif tracker.name == "wandb":
-
             formatted_images = []
 
             for log in image_logs:
-
                 images = log["images"]
-
-                validation_prompt = log[
-                    "validation_prompt"
-                ]
-
-                validation_image = log[
-                    "validation_image"
-                ]
+                validation_prompt = log["validation_prompt"]
+                validation_image = log["validation_image"]
 
                 formatted_images.append(
-                    wandb.Image(
-                        validation_image,
-                        caption="BrushNet conditioning",
-                    )
+                    wandb.Image(validation_image, caption="BrushNet conditioning")
                 )
 
                 for image in images:
-
                     formatted_images.append(
-                        wandb.Image(
-                            image,
-                            caption=validation_prompt,
-                        )
+                        wandb.Image(image, caption=validation_prompt)
                     )
 
-            tracker.log(
-                {
-                    tracker_key: formatted_images
-                },
-                step=step,
-            )
+            tracker.log({tracker_key: formatted_images}, step=step)
 
             if validation_metrics is not None:
-
                 tracker.log(
-                    {
-                        f"{tracker_key}/{k}": v
-                        for k, v
-                        in validation_metrics.items()
-                    },
+                    {f"{tracker_key}/{k}": v for k, v in validation_metrics.items()},
                     step=step,
                 )
 
         else:
-            logger.warning(
-                "Image logging not implemented "
-                f"for {tracker.name}"
-            )
+            logger.warning(f"Image logging not implemented for {tracker.name}")
 
-    # ==========================================
-    # 清理 CPU validation temporary objects
-    # ==========================================
-
+    # 清理 validation 临时对象
     metric_samples.clear()
-
     gc.collect()
-
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     return image_logs
+
 def log_validation(
     vae, text_encoder, tokenizer, unet, brushnet, args, accelerator, weight_dtype, step, is_final_validation=False
 ):
@@ -877,7 +711,32 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--validation_prompt",
         type=str,
-        default=["a cake with orange frosting and blueberries"],
+        default=[
+            "a black and red mountain bike parked on the side of a building",
+            "a cake with orange frosting and blueberries",
+            "a cat is sitting on a wooden chair",
+            "a kitten is playing with a flower",
+            "a german shepherd dog standing in a field",
+            "a plate of dumplings with chopsticks on top",
+            "two parrots sitting on a metal stand with food",
+            "a close up of a cherry blossom with white flowers",
+            "a boy walking his dog in the park",
+            "a painting of clouds in the sky",
+            "a painting of flowers in a blue and white vase",
+            "autumn road in the forest - stock photo",
+            "a vase with three flowers in it on a dark background",
+            "a bird with a black and white face sitting on a tree branch",
+            "a lighthouse in the middle of a stormy sea",
+            "a painting of a cup on top of books",
+            "a painting of a cabin in the snow with mountains in the background",
+            "a cat is shown in low polygonal style",
+            "a pug dog holding a red heart in its mouth",
+            "wolf howling at the moon digital art wolf howling at the moon by person",
+            "a jockey is riding a horse in a race",
+            "a plate with rice, peas and lemon wedges",
+            "a woman with her hair wrapped up in a towel",
+            "a cartoon girl sitting at a table with a pizza and a drink",
+        ],
         nargs="+",
         help=(
             "A set of prompts evaluated every `--validation_steps` and logged to `--report_to`."
@@ -888,7 +747,32 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--validation_image",
         type=str,
-        default=["examples/brushnet/src/test_image.jpg"],
+        default=[
+            "examples/brushnet/src/images/000000000_ori.jpg",
+            "examples/brushnet/src/images/000000001_ori.jpg",
+            "examples/brushnet/src/images/000000002_ori.jpg",
+            "examples/brushnet/src/images/000000003_ori.jpg",
+            "examples/brushnet/src/images/000000004_ori.jpg",
+            "examples/brushnet/src/images/000000005_ori.jpg",
+            "examples/brushnet/src/images/000000006_ori.jpg",
+            "examples/brushnet/src/images/000000007_ori.jpg",
+            "examples/brushnet/src/images/000000008_ori.jpg",
+            "examples/brushnet/src/images/000000009_ori.jpg",
+            "examples/brushnet/src/images/000000010_ori.jpg",
+            "examples/brushnet/src/images/000000011_ori.jpg",
+            "examples/brushnet/src/images/000000012_ori.jpg",
+            "examples/brushnet/src/images/000000013_ori.jpg",
+            "examples/brushnet/src/images/000000014_ori.jpg",
+            "examples/brushnet/src/images/000000015_ori.jpg",
+            "examples/brushnet/src/images/000000016_ori.jpg",
+            "examples/brushnet/src/images/000000017_ori.jpg",
+            "examples/brushnet/src/images/000000018_ori.jpg",
+            "examples/brushnet/src/images/000000019_ori.jpg",
+            "examples/brushnet/src/images/000000020_ori.jpg",
+            "examples/brushnet/src/images/000000021_ori.jpg",
+            "examples/brushnet/src/images/000000022_ori.jpg",
+            "examples/brushnet/src/images/000000023_ori.jpg",
+        ],
         nargs="+",
         help=(
             "A set of paths to the paintingnet conditioning image be evaluated every `--validation_steps`"
@@ -900,7 +784,32 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--validation_mask",
         type=str,
-        default=["examples/brushnet/src/test_mask.jpg"],
+        default=[
+            "examples/brushnet/src/images/000000000_mask.jpg",
+            "examples/brushnet/src/images/000000001_mask.jpg",
+            "examples/brushnet/src/images/000000002_mask.jpg",
+            "examples/brushnet/src/images/000000003_mask.jpg",
+            "examples/brushnet/src/images/000000004_mask.jpg",
+            "examples/brushnet/src/images/000000005_mask.jpg",
+            "examples/brushnet/src/images/000000006_mask.jpg",
+            "examples/brushnet/src/images/000000007_mask.jpg",
+            "examples/brushnet/src/images/000000008_mask.jpg",
+            "examples/brushnet/src/images/000000009_mask.jpg",
+            "examples/brushnet/src/images/000000010_mask.jpg",
+            "examples/brushnet/src/images/000000011_mask.jpg",
+            "examples/brushnet/src/images/000000012_mask.jpg",
+            "examples/brushnet/src/images/000000013_mask.jpg",
+            "examples/brushnet/src/images/000000014_mask.jpg",
+            "examples/brushnet/src/images/000000015_mask.jpg",
+            "examples/brushnet/src/images/000000016_mask.jpg",
+            "examples/brushnet/src/images/000000017_mask.jpg",
+            "examples/brushnet/src/images/000000018_mask.jpg",
+            "examples/brushnet/src/images/000000019_mask.jpg",
+            "examples/brushnet/src/images/000000020_mask.jpg",
+            "examples/brushnet/src/images/000000021_mask.jpg",
+            "examples/brushnet/src/images/000000022_mask.jpg",
+            "examples/brushnet/src/images/000000023_mask.jpg",
+        ],
         nargs="+",
         help=(
             "A set of paths to the paintingnet conditioning image be evaluated every `--validation_steps`"
