@@ -141,6 +141,8 @@ def log_validation_evaluator(
             device=accelerator.device
         ).manual_seed(args.seed)
 
+    generator = torch.Generator(device=accelerator.device).manual_seed(1234)
+
     # ==========================================
     # Validation data
     # ==========================================
@@ -221,7 +223,7 @@ def log_validation_evaluator(
                     validation_prompt,
                     conditioning_image,
                     mask_image,
-                    num_inference_steps=20,
+                    num_inference_steps=50,
                     generator=generator,
                 ).images[0]
 
@@ -658,7 +660,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resolution",
         type=int,
-        default=1234,
+        default=512,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
@@ -875,7 +877,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--validation_prompt",
         type=str,
-        default=["A cake on the table."],
+        default=["a cake with orange frosting and blueberries"],
         nargs="+",
         help=(
             "A set of prompts evaluated every `--validation_steps` and logged to `--report_to`."
