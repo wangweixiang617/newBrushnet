@@ -1061,6 +1061,7 @@ class MyWebDataset():
         conditioning_pixel_values=[]
         masks=[]
         input_ids=[]
+        sample_keys = []
         
         for example in examples:
             caption=example["caption"].decode('utf-8')
@@ -1068,6 +1069,7 @@ class MyWebDataset():
             width=int(example["width"].decode('utf-8'))
             image = cv2.imdecode(np.asarray(bytearray(example["image"]), dtype="uint8"), cv2.IMREAD_COLOR)
             segmentation = json.loads(example["segmentation"])
+
 
             if len(segmentation["mask"])>0:
                 mask=self.rle2mask(random.choice(segmentation["mask"]),(height,width))[:,:,np.newaxis]
@@ -1129,11 +1131,15 @@ class MyWebDataset():
         masks = masks.to(memory_format=torch.contiguous_format).float()
         input_ids = torch.stack(input_ids)
 
+        tar_id = int(os.path.splitext(os.path.basename(example["__url__"]))[0])
+        sample_key = int(example["__key__"])
+        sample_keys.append([tar_id, sample_key])
         return {
             "pixel_values": pixel_values,
             "conditioning_pixel_values": conditioning_pixel_values,
             "masks":masks,
             "input_ids": input_ids,
+            "sample_keys": torch.tensor(sample_keys, dtype=torch.long),
         }
 
 
@@ -1463,11 +1469,27 @@ def main(args):
     #     batch_size=args.train_batch_size,
     #     num_workers=args.dataloader_num_workers,
     # )
-    train_dataset = load_dataset("webdataset", 
-                    data_files={"train": os.path.join(args.train_data_dir,"*.tar")}, 
-                    split="train", 
-                    streaming=True)
-    train_dataset_len= 10000*len(os.listdir(args.train_data_dir))
+
+    # 固定 tar 顺序，只统计 .tar
+    SAMPLES_PER_TAR = 10000
+    tar_files = sorted(
+        os.path.join(args.train_data_dir, name)
+        for name in os.listdir(args.train_data_dir)
+        if name.endswith(".tar")
+    )
+
+    train_dataset_len = SAMPLES_PER_TAR * len(tar_files)
+    train_dataset = load_dataset(
+        "webdataset",
+        data_files={"train": tar_files},
+        split="train",
+        streaming=True,
+    )
+    # train_dataset = load_dataset("webdataset",
+    #                 data_files={"train": os.path.join(args.train_data_dir,"*.tar")},
+    #                 split="train",
+    #                 streaming=True)
+    # train_dataset_len= 10000*len(os.listdir(args.train_data_dir))
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=False,
@@ -1555,6 +1577,7 @@ def main(args):
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
+    resume_dataloader = None
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
@@ -1580,6 +1603,61 @@ def main(args):
 
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
+
+            # 计算 checkpoint 在当前 epoch 中已经消费的全局图片数
+            steps_in_epoch = global_step % num_update_steps_per_epoch
+            samples_in_epoch = steps_in_epoch * total_batch_size
+
+            # 直接定位到对应 tar，只需在当前 tar 内最多跳过 9999 张
+            resume_tar_index, resume_sample_offset = divmod(
+                samples_in_epoch,
+                SAMPLES_PER_TAR,
+            )
+
+            logger.info(
+                f"Resume data position: epoch={first_epoch}, "
+                f"samples={samples_in_epoch}, "
+                f"tar={resume_tar_index}, offset={resume_sample_offset}",
+                main_process_only=True,
+            )
+
+            resume_tar_files = tar_files[resume_tar_index:]
+
+            if len(resume_tar_files) == 0:
+                raise RuntimeError(
+                    f"Resume tar index {resume_tar_index} exceeds tar count {len(tar_files)}"
+                )
+
+            logger.info(
+                f"Resume from {os.path.basename(resume_tar_files[0])}, "
+                f"sample offset={resume_sample_offset}",
+                main_process_only=True,
+            )
+
+            resume_dataset = load_dataset(
+                "webdataset",
+                data_files={"train": resume_tar_files},
+                split="train",
+                streaming=True,
+            )
+
+            # 如果 checkpoint 不刚好落在 tar 边界，只跳当前 tar 内剩余部分
+            if resume_sample_offset > 0:
+                resume_dataset = resume_dataset.skip(resume_sample_offset)
+
+            resume_dataloader = torch.utils.data.DataLoader(
+                resume_dataset,
+                shuffle=False,
+                collate_fn=MyWebDataset(
+                    resolution=args.resolution,
+                    tokenizer=tokenizer,
+                    random_mask=args.random_mask,
+                ),
+                batch_size=args.train_batch_size,
+                num_workers=args.dataloader_num_workers,
+            )
+
+            resume_dataloader = accelerator.prepare(resume_dataloader)
     else:
         initial_global_step = 0
 
@@ -1593,7 +1671,18 @@ def main(args):
 
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
-        for step, batch in enumerate(train_dataloader):
+        # Resume 的第一个 epoch 使用定位后的 tar，之后恢复完整数据集
+        if epoch == first_epoch and resume_dataloader is not None:
+            active_dataloader = resume_dataloader
+        else:
+            active_dataloader = train_dataloader
+
+        for step, batch in enumerate(active_dataloader):
+            # 测试跳过的结果
+            if accelerator.is_main_process and epoch == first_epoch and step == 0:
+                keys = batch["sample_keys"].detach().cpu().tolist()
+                keys = [f"{tar_id:05d}.tar:{key:09d}" for tar_id, key in keys]
+                logger.info(f"[RESUME CHECK] step={global_step + 1}, keys={keys}")
             with accelerator.accumulate(brushnet):
                 # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
