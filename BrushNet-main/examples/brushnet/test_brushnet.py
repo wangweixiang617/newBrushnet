@@ -19,19 +19,24 @@ blended = False
 # input source image / mask image path and the text prompt
 image_path="examples/brushnet/src/test_image.jpg"
 mask_path="examples/brushnet/src/test_mask.jpg"
+image_path="examples/brushnet/src/images/000000000_ori.jpg"
+mask_path="examples/brushnet/src/images/000000000_mask.jpg"
 # image_path="../../examples/brushnet/src/test_image.jpg"
 # mask_path="../../examples/brushnet/src/test_mask.jpg"
 
-caption="A cake on the table."
-
+image01_path ="examples/brushnet/src/images/000000001.jpg"
+# caption="a cake with orange frosting and blueberries"
+caption = "a black and red mountain bike parked on the side of a building"
 # conditioning scale
 brushnet_conditioning_scale=1.0
 
 brushnet = BrushNetModel.from_pretrained(brushnet_path, torch_dtype=torch.float16)
 pipe = StableDiffusionBrushNetPipeline.from_pretrained(
-    base_model_path, brushnet=brushnet, torch_dtype=torch.float16, low_cpu_mem_usage=False
-)
+    base_model_path, brushnet=brushnet, torch_dtype=torch.float16, low_cpu_mem_usage=False,
+    safety_checker=None, feature_extractor=None, requires_safety_checker=False
 
+)
+print("NSFW safety checker:", pipe.safety_checker)
 # speed up diffusion process with faster scheduler and memory optimization
 pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
 # remove following line if xformers is not installed or when using Torch 2.0.
@@ -39,10 +44,11 @@ pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
 # memory optimization.
 pipe.enable_model_cpu_offload()
 
-init_image = cv2.imread(image_path)[:,:,::-1]
+original_image_np = cv2.imread(image_path)[:,:,::-1]
 mask_image = 1.*(cv2.imread(mask_path).sum(-1)>255)[:,:,np.newaxis]
-init_image = init_image * (1-mask_image)
+init_image = original_image_np * (1-mask_image)
 
+gt_image = Image.fromarray(original_image_np.astype(np.uint8)).convert("RGB")
 init_image = Image.fromarray(init_image.astype(np.uint8)).convert("RGB")
 mask_image = Image.fromarray(mask_image.astype(np.uint8).repeat(3,-1)*255).convert("RGB")
 
@@ -56,6 +62,10 @@ image = pipe(
     generator=generator,
     brushnet_conditioning_scale=brushnet_conditioning_scale
 ).images[0]
+
+# image01 = cv2.imread(image01_path)[:,:,::-1]
+# image01 = Image.fromarray(image01.astype(np.uint8)).convert("RGB")
+# image = image01
 
 if blended:
     image_np=np.array(image)
@@ -72,6 +82,7 @@ if blended:
     image=Image.fromarray(image_pasted)
 
 image.save("output.png")
+# mask_image.save("mask.png")
 from validation_evaluator import BrushNetValidationEvaluator
 device = "cuda" if torch.cuda.is_available() else "cpu"
 evaluator = BrushNetValidationEvaluator(
@@ -89,7 +100,7 @@ try:
     print("\n===== Light evaluation =====")
 
     light_result = evaluator.evaluate(
-        gt_image=init_image,
+        gt_image=gt_image,
         pred_image=image,
         mask_image=mask_image,
         full=False,
@@ -104,7 +115,7 @@ try:
     print("\n===== Full evaluation =====")
 
     full_result = evaluator.evaluate(
-        gt_image=init_image,
+        gt_image=gt_image,
         pred_image=image,
         mask_image=mask_image,
         prompt=caption,

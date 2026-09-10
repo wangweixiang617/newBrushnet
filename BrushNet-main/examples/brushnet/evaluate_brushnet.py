@@ -305,11 +305,14 @@ evaluation_df = pd.DataFrame(columns=['Image ID','Image Reward', 'HPS V2.1', 'Ae
 
 metrics_calculator=MetricsCalculator(device)
 
+
 for key, item in mapping_file.items():
     print(f"evaluating image {key} ...")
     image_path=item["image"]
     mask=item[args.mask_key]
     prompt=item["caption"]
+    print(prompt)
+
 
     src_image_path = os.path.join(args.base_dir, image_path)
     src_image = Image.open(src_image_path).resize((512,512))
@@ -347,7 +350,8 @@ for key, item in mapping_file.items():
             metric_result = metrics_calculator.calculate_clip_similarity(tgt_image, prompt)
 
         evaluation_result.append(metric_result)
-    
+        print(metric_result)
+
     evaluation_df.loc[len(evaluation_df.index)] = evaluation_result
 
 print("The averaged evaluation result:")

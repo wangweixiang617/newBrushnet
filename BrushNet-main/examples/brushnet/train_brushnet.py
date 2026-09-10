@@ -56,7 +56,7 @@ if is_wandb_available():
 check_min_version("0.27.0.dev0")
 
 logger = get_logger(__name__)
-VALIDATIONCOUNTMAX: int = 8 #验证集最大数量
+VALIDATIONCOUNTMAX: int = 24 #验证集最大数量
 
 def image_grid(imgs, rows, cols):
     assert len(imgs) == rows * cols
@@ -67,7 +67,6 @@ def image_grid(imgs, rows, cols):
     for i, img in enumerate(imgs):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
-
 def log_validation_evaluator(
     vae,
     text_encoder,
@@ -82,6 +81,12 @@ def log_validation_evaluator(
     is_final_validation=False,
 ):
     logger.info("Running validation...")
+
+    if validation_evaluator is not None:
+        validation_evaluator.print_cuda_memory("Running validation")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # 当前 BrushNet
     if not is_final_validation:
@@ -106,7 +111,7 @@ def log_validation_evaluator(
     )
     pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
     pipeline = pipeline.to(accelerator.device)
-    # pipeline.set_progress_bar_config(disable=True)
+    pipeline.set_progress_bar_config(disable=True)
 
     if args.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
@@ -122,18 +127,15 @@ def log_validation_evaluator(
     else:
         raise ValueError("The number of validation_image, validation_prompt and validation_mask must match.")
 
-    image_logs = []
-    metric_samples = []
+    # 最多只取前 VALIDATIONCOUNTMAX 个
+    validation_items = list(zip(validation_prompts, validation_images, validation_masks))[:VALIDATIONCOUNTMAX]
+    image_logs, metric_samples = [], []
     inference_ctx = contextlib.nullcontext() if is_final_validation else torch.autocast("cuda")
+    validation_batch_size = max(1, getattr(args, "validation_batch_size", 4))
 
-    validation_count = 0
-    # Generate
-    for validation_prompt, validation_image_path, validation_mask_path in zip(
-        validation_prompts, validation_images, validation_masks
-    ):
-        validation_count = validation_count + 1
-        if validation_count > VALIDATIONCOUNTMAX:
-            break
+    # 先把 validation 样本都准备好
+    prepared_samples = []
+    for validation_prompt, validation_image_path, validation_mask_path in validation_items:
         # GT 原图必须保留，用于 PSNR / LPIPS / MSE
         gt_image = Image.open(validation_image_path).convert("RGB")
         mask_image = Image.open(validation_mask_path).convert("RGB")
@@ -145,35 +147,74 @@ def log_validation_evaluator(
             mask_image.convert("L"),
         )
 
-        images = []
+        prepared_samples.append(
+            {
+                "prompt": validation_prompt,
+                "gt_image": gt_image,
+                "mask_image": mask_image,
+                "conditioning_image": conditioning_image,
+                "images": [],
+            }
+        )
 
-        for _ in range(args.num_validation_images):
+    # Validation 进度如：24 samples × 2 images = 48 images
+    total_validation_images = len(prepared_samples) * args.num_validation_images
+    batches_per_repeat = math.ceil(len(prepared_samples) / validation_batch_size)
+
+    validation_pbar = tqdm(
+        total=total_validation_images,
+        desc=f"Validation {step}",
+        unit="img",
+        disable=not accelerator.is_main_process,
+        leave=False,
+    )
+
+    # 按 repeat 生成，这样仍保留每个样本 num_validation_images 张输出的语义
+    for repeat_idx in range(args.num_validation_images):
+        for batch_idx, batch_start in enumerate(range(0, len(prepared_samples), validation_batch_size)):
+            batch_samples = prepared_samples[batch_start:batch_start + validation_batch_size]
+            batch_prompts = [sample["prompt"] for sample in batch_samples]
+            batch_conditioning_images = [sample["conditioning_image"] for sample in batch_samples]
+            batch_mask_images = [sample["mask_image"] for sample in batch_samples]
+
             with inference_ctx:
-                generated_image = pipeline(
-                    validation_prompt,
-                    conditioning_image,
-                    mask_image,
+                batch_result = pipeline(
+                    batch_prompts,
+                    batch_conditioning_images,
+                    batch_mask_images,
                     num_inference_steps=50,
                     generator=generator,
-                ).images[0]
-
-            images.append(generated_image)
-
-            if validation_evaluator is not None:
-                metric_samples.append(
-                    {
-                        "gt_image": gt_image.copy(),
-                        "pred_image": generated_image.copy(),
-                        "mask_image": mask_image.copy(),
-                        "prompt": validation_prompt,
-                    }
                 )
 
+            for i, generated_image in enumerate(batch_result.images):
+                sample = batch_samples[i]
+                sample["images"].append(generated_image)
+
+                if validation_evaluator is not None:
+                    metric_samples.append(
+                        {
+                            "gt_image": sample["gt_image"].copy(),
+                            "pred_image": generated_image.copy(),
+                            "mask_image": sample["mask_image"].copy(),
+                            "prompt": sample["prompt"],
+                        }
+                    )
+
+            validation_pbar.set_postfix_str(
+                f"repeat {repeat_idx + 1}/{args.num_validation_images}, "
+                f"batch {batch_idx + 1}/{batches_per_repeat}"
+            )
+            validation_pbar.update(len(batch_samples))
+
+    validation_pbar.close()
+
+    # 整理 image_logs
+    for sample in prepared_samples:
         image_logs.append(
             {
-                "validation_image": conditioning_image,
-                "images": images,
-                "validation_prompt": validation_prompt,
+                "validation_image": sample["conditioning_image"],
+                "images": sample["images"],
+                "validation_prompt": sample["prompt"],
             }
         )
 
@@ -185,7 +226,6 @@ def log_validation_evaluator(
 
     # Metrics
     validation_metrics = None
-
     if validation_evaluator is not None and len(metric_samples) > 0:
         # final validation 一定计算完整 7 个指标
         run_full_metrics = is_final_validation
@@ -245,14 +285,10 @@ def log_validation_evaluator(
                 validation_prompt = log["validation_prompt"]
                 validation_image = log["validation_image"]
 
-                formatted_images.append(
-                    wandb.Image(validation_image, caption="BrushNet conditioning")
-                )
+                formatted_images.append(wandb.Image(validation_image, caption="BrushNet conditioning"))
 
                 for image in images:
-                    formatted_images.append(
-                        wandb.Image(image, caption=validation_prompt)
-                    )
+                    formatted_images.append(wandb.Image(image, caption=validation_prompt))
 
             tracker.log({tracker_key: formatted_images}, step=step)
 
@@ -267,12 +303,12 @@ def log_validation_evaluator(
 
     # 清理 validation 临时对象
     metric_samples.clear()
+    prepared_samples.clear()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     return image_logs
-
 def log_validation(
     vae, text_encoder, tokenizer, unet, brushnet, args, accelerator, weight_dtype, step, is_final_validation=False
 ):
@@ -874,6 +910,13 @@ def parse_args(input_args=None):
         "--validation_metric_ckpt_path",
         type=str,
         default="data/ckpt",
+    )
+
+    parser.add_argument(
+        "--validation_batch_size",
+        type=int,
+        default=4,
+        help="Batch size used for validation generation.",
     )
 
     if input_args is not None:
