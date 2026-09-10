@@ -12,58 +12,16 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 import open_clip
 import ImageReward as RM
+import transformers
 
 
 class BrushNetValidationEvaluator:
-    """
-    BrushNet validation evaluator.
+    """BrushNet validation evaluator.
 
-    light mode:
-        PSNR
-        LPIPS
-        MSE
-
-    full mode:
-        Image Reward
-        HPS V2.1
-        Aesthetic Score
-        PSNR
-        LPIPS
-        MSE
-        CLIP Similarity
-
-    BrushNet preservation metrics:
-        原始 mask:
-            1 = 编辑区域
-            0 = 保留区域
-
-        评价:
-            preserve_mask = 1 - mask
-
-        因此 PSNR / LPIPS / MSE 都只评价非编辑区域。
-
-    显存策略（offload=True）:
-        - metric 默认保存在 CPU
-        - 使用时 CPU -> GPU
-        - 当前 metric 计算结束后 GPU -> CPU
-        - 避免 LPIPS / CLIP / Aesthetic / ImageReward / HPS 同时常驻 GPU
-
-    HPS 优化:
-        不再直接调用 hpsv2.score()。官方 hpsv2.score() 每次调用都会重新
-        torch.load(checkpoint) + load_state_dict()。
-
-        当前实现:
-            第一次 full validation:
-                创建 ViT-H-14
-                checkpoint 只加载一次
-                模型保存在 CPU
-
-            每次 HPS:
-                CPU -> GPU
-                计算所有 validation samples
-                GPU -> CPU
-
-        后续 full validation 不再重新读取 HPS checkpoint。
+    Light: PSNR / LPIPS / MSE；Full: ImageReward / HPS v2.1 / Aesthetic / PSNR / LPIPS / MSE / CLIP。
+    BrushNet mask: 1=编辑区域，0=保留区域；preservation metrics 使用 preserve_mask=1-mask。
+    offload=True 时各 metric 默认保存在 CPU，计算时移到 GPU，结束后移回 CPU。
+    HPS v2.1 模型与 checkpoint 仅首次 full validation 加载一次，后续复用 CPU 模型。
     """
 
     def __init__(
@@ -86,12 +44,10 @@ class BrushNetValidationEvaluator:
         # True: 每种 metric 用完以后移回 CPU。训练阶段建议保持 True。
         self.offload = offload
 
-        # Light metric ---------------------------------------------------------
-        # LPIPS 使用 BrushNet 官方一致的 SqueezeNet；初始化时默认在 CPU。
+        # Light metric：LPIPS 使用 BrushNet 官方一致的 SqueezeNet，初始化在 CPU。
         self.lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type="squeeze").eval()
 
-        # Heavy metrics --------------------------------------------------------
-        # 全部 lazy load，第一次 full=True 时才加载。
+        # Heavy metrics：全部 lazy load，第一次 full=True 时才加载。
         self.clip_metric = None
         self.aesthetic_model = None
         self.aesthetic_clip_model = None
@@ -104,16 +60,10 @@ class BrushNetValidationEvaluator:
         self.hps_tokenizer = None
         self._resolved_hps_ckpt_path = None
 
-    # Basic utilities =========================================================
-
+    # Basic utilities
     @staticmethod
     def _clear_cuda():
-        """
-        清理 Python 无引用对象和 PyTorch CUDA cache。
-
-        注意: empty_cache() 不能释放仍被 Tensor/model 引用的显存，
-        所以必须先 .cpu() 或 del。
-        """
+        """清理 Python 无引用对象和 CUDA cache；仍被引用的 Tensor/model 不会被 empty_cache() 释放。"""
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -131,11 +81,10 @@ class BrushNetValidationEvaluator:
             return BrushNetValidationEvaluator._to_float(value[0])
         return float(value)
 
-    # Image / mask ============================================================
-
+    # Image / mask
     @staticmethod
     def _prepare_images(gt_image, pred_image):
-        """PIL -> numpy float32 [0,1]."""
+        """PIL RGB -> numpy float32 [0,1]；必要时将 pred resize 到 GT 尺寸。"""
         gt_image = gt_image.convert("RGB")
         pred_image = pred_image.convert("RGB")
 
@@ -148,14 +97,7 @@ class BrushNetValidationEvaluator:
 
     @staticmethod
     def _prepare_preserve_mask(mask_image, image_size):
-        """
-        BrushNet:
-            白色 / 1 = 编辑区域
-            黑色 / 0 = 非编辑区域
-
-        preservation metric:
-            preserve_mask = 1 - edit_mask
-        """
+        """将白色/1 编辑 mask 转成 preserve_mask=1-edit_mask；resize 时使用 NEAREST。"""
         mask_image = mask_image.convert("L")
 
         if mask_image.size != image_size:
@@ -168,20 +110,10 @@ class BrushNetValidationEvaluator:
         preserve_mask = 1.0 - mask
         return preserve_mask[:, :, None]
 
-    # PSNR / MSE ==============================================================
-
+    # PSNR / MSE
     @staticmethod
     def _calculate_mse(gt, pred, preserve_mask):
-        """
-        与 BrushNet 官方 evaluation 的 MSE 定义保持一致。
-
-        注意:
-            numerator: RGB 3 channel 全部求和
-            denominator: preserve_mask.sum()
-
-        denominator 没有乘 3，不要改成常规 RGB channel mean，
-        否则数值会和 BrushNet 官方 evaluation 不一致。
-        """
+        """BrushNet 官方 MSE：RGB 三通道误差求和，分母为 preserve_mask.sum()，不乘 3。"""
         gt_masked = gt * preserve_mask
         pred_masked = pred * preserve_mask
         difference = pred_masked - gt_masked
@@ -200,8 +132,7 @@ class BrushNetValidationEvaluator:
             return 1000.0
         return 20.0 * math.log10(1.0 / math.sqrt(mse))
 
-    # LPIPS ===================================================================
-
+    # LPIPS
     def _lpips_to_gpu(self):
         self.lpips_metric = self.lpips_metric.to(self.device).eval()
 
@@ -211,26 +142,14 @@ class BrushNetValidationEvaluator:
         self._clear_cuda()
 
     def _calculate_lpips_one(self, gt, pred, preserve_mask):
-        """
-        此函数假设 LPIPS 已经在 GPU。
-
-        与 BrushNet 官方 evaluation 一致:
-            image -> [0,1]
-            mask
-            -> [-1,1]
-            -> LPIPS SqueezeNet
-        """
+        """LPIPS 已在 GPU；按 BrushNet 官方逻辑先 mask，再将 [0,1] 映射到 [-1,1]。"""
         gt = gt * preserve_mask
         pred = pred * preserve_mask
 
         gt_tensor = pred_tensor = score = None
         try:
-            gt_tensor = (
-                torch.from_numpy(gt).permute(2, 0, 1).unsqueeze(0).to(self.device, dtype=torch.float32)
-            )
-            pred_tensor = (
-                torch.from_numpy(pred).permute(2, 0, 1).unsqueeze(0).to(self.device, dtype=torch.float32)
-            )
+            gt_tensor = torch.from_numpy(gt).permute(2, 0, 1).unsqueeze(0).to(self.device, dtype=torch.float32)
+            pred_tensor = torch.from_numpy(pred).permute(2, 0, 1).unsqueeze(0).to(self.device, dtype=torch.float32)
 
             # [0,1] -> [-1,1]
             gt_tensor = gt_tensor * 2.0 - 1.0
@@ -245,23 +164,21 @@ class BrushNetValidationEvaluator:
             # 单张中间 Tensor 显式释放；整个 batch 完成后 LPIPS model 再回 CPU。
             del gt_tensor, pred_tensor, score
 
-    # CLIP Similarity =========================================================
-
+    # CLIP Similarity
     def _load_clip_metric(self):
-        """CLIPScore lazy load；第一次 full=True 才创建，默认留在 CPU。"""
+        """CLIPScore lazy load；第一次 full=True 时创建，默认留在 CPU。"""
         if self.clip_metric is None:
             print("[Evaluator] Loading CLIPScore...")
             self.clip_metric = CLIPScore(model_name_or_path=self.clip_score_model_path).eval()
 
     def _calculate_clip_batch(self, samples):
-        """
-        CLIP 生命周期:
-            CPU -> GPU -> 所有 samples -> CPU
-
-        CPU -> GPU 也放入 try；即使 .to(self.device) 异常，finally 仍会尝试清理。
-        """
+        """CLIP 生命周期：CPU -> GPU -> 计算所有 samples -> CPU。"""
         self._load_clip_metric()
         scores = []
+
+        #临时关闭warning 太烦了
+        old_verbosity = transformers.utils.logging.get_verbosity()
+        transformers.utils.logging.set_verbosity_error()
 
         try:
             self.clip_metric = self.clip_metric.to(self.device).eval()
@@ -282,21 +199,16 @@ class BrushNetValidationEvaluator:
                 finally:
                     del image_tensor, score
         finally:
+            transformers.utils.logging.set_verbosity(old_verbosity)
             if self.offload and self.clip_metric is not None:
                 self.clip_metric = self.clip_metric.cpu()
             self._clear_cuda()
 
         return scores
 
-    # Aesthetic Score =========================================================
-
+    # Aesthetic Score
     def _load_aesthetic_model(self):
-        """
-        Aesthetic:
-            OpenCLIP ViT-L/14 + 768 -> 1 linear predictor
-
-        第一次 full=True 才加载。
-        """
+        """Lazy load Aesthetic 模型：OpenCLIP ViT-L/14 + 768->1 linear predictor。"""
         if self.aesthetic_model is not None:
             return
 
@@ -306,9 +218,7 @@ class BrushNetValidationEvaluator:
         openclip_path = os.path.join(self.ckpt_path, "aesthetic", "ViT-L-14.pt")
 
         if not os.path.isfile(linear_path) or not os.path.isfile(openclip_path):
-            raise FileNotFoundError(
-                f"Aesthetic checkpoint missing: {linear_path} / {openclip_path}"
-            )
+            raise FileNotFoundError(f"Aesthetic checkpoint missing: {linear_path} / {openclip_path}")
 
         # linear head 初始化在 CPU。
         self.aesthetic_model = torch.nn.Linear(768, 1)
@@ -319,22 +229,12 @@ class BrushNetValidationEvaluator:
 
         # OpenAI CLIP ViT-L/14；当前 torch 2.11 环境使用 load_weights_only=False。
         self.aesthetic_clip_model, _, self.aesthetic_preprocess = open_clip.create_model_and_transforms(
-            "ViT-L-14",
-            pretrained=openclip_path,
-            load_weights_only=False,
+            "ViT-L-14", pretrained=openclip_path, load_weights_only=False
         )
         self.aesthetic_clip_model.eval()
 
     def _calculate_aesthetic_batch(self, samples):
-        """
-        Aesthetic 生命周期:
-            Linear CPU -> GPU
-            ViT-L CPU -> GPU
-            所有 samples
-            两个模型 -> CPU
-
-        两个 .to(cuda) 都放入 try，避免一个已上 GPU、另一个 OOM 后无法清理。
-        """
+        """Aesthetic 模型 CPU -> GPU，计算所有 samples 后移回 CPU。"""
         self._load_aesthetic_model()
         scores = []
 
@@ -346,11 +246,7 @@ class BrushNetValidationEvaluator:
                 for sample in samples:
                     image = image_features = prediction = None
                     try:
-                        image = (
-                            self.aesthetic_preprocess(sample["pred_image"].convert("RGB"))
-                            .unsqueeze(0)
-                            .to(self.device)
-                        )
+                        image = self.aesthetic_preprocess(sample["pred_image"].convert("RGB")).unsqueeze(0).to(self.device)
 
                         image_features = self.aesthetic_clip_model.encode_image(image)
 
@@ -372,8 +268,7 @@ class BrushNetValidationEvaluator:
 
         return scores
 
-    # ImageReward ==============================================================
-
+    # ImageReward
     def _load_image_reward(self):
         """ImageReward lazy load；第一次 full=True 时加载到 CPU。"""
         if self.image_reward_model is not None:
@@ -385,32 +280,18 @@ class BrushNetValidationEvaluator:
         med_config_path = os.path.join(self.ckpt_path, "ImageReward", "med_config.json")
 
         if not os.path.isfile(image_reward_path) or not os.path.isfile(med_config_path):
-            raise FileNotFoundError(
-                f"ImageReward checkpoint missing: {image_reward_path} / {med_config_path}"
-            )
+            raise FileNotFoundError(f"ImageReward checkpoint missing: {image_reward_path} / {med_config_path}")
 
         # 初始化到 CPU。
-        self.image_reward_model = RM.load(
-            image_reward_path,
-            device="cpu",
-            med_config=med_config_path,
-        ).eval()
+        self.image_reward_model = RM.load(image_reward_path, device="cpu", med_config=med_config_path).eval()
 
     def _image_reward_to_device(self, device):
-        """
-        ImageReward 不仅要 model.to(device)。
-
-        它内部 score() 还使用 self.device 移动 tokenizer/image tensor，
-        因此必须同步修改 self.device。
-        """
+        """同步移动 ImageReward model 并更新其内部 self.device。"""
         self.image_reward_model = self.image_reward_model.to(device)
         self.image_reward_model.device = torch.device(device)
 
     def _calculate_image_reward_batch(self, samples):
-        """
-        ImageReward:
-            CPU -> GPU -> 所有 samples -> CPU
-        """
+        """ImageReward：CPU -> GPU -> 计算所有 samples -> CPU。"""
         self._load_image_reward()
         scores = []
 
@@ -420,10 +301,7 @@ class BrushNetValidationEvaluator:
 
             with torch.inference_mode():
                 for sample in samples:
-                    reward = self.image_reward_model.score(
-                        sample["prompt"],
-                        [sample["pred_image"]],
-                    )
+                    reward = self.image_reward_model.score(sample["prompt"], [sample["pred_image"]])
                     scores.append(self._to_float(reward))
         finally:
             if self.offload and self.image_reward_model is not None:
@@ -436,17 +314,9 @@ class BrushNetValidationEvaluator:
 
         return scores
 
-    # HPS v2.1 ================================================================
-
+    # HPS v2.1
     def _resolve_hps_checkpoint(self):
-        """
-        HPS v2.1 checkpoint 路径优先级:
-
-            1. 显式传入 hps_ckpt_path
-            2. Hugging Face cache / 当前 HF_ENDPOINT
-
-        路径只解析一次。
-        """
+        """解析 HPS v2.1 checkpoint：优先显式路径，否则使用 Hugging Face cache/当前 endpoint。"""
         if self._resolved_hps_ckpt_path is not None:
             return self._resolved_hps_ckpt_path
 
@@ -465,27 +335,14 @@ class BrushNetValidationEvaluator:
         return path
 
     def _load_hps_model(self):
-        """
-        HPS 模型和 checkpoint 只初始化一次。
-
-        第一次 full=True:
-            create ViT-H-14 on CPU
-            -> torch.load(checkpoint, map_location="cpu")
-            -> load_state_dict()
-            -> tokenizer
-            -> 保留 CPU 模型
-
-        后续 full=True:
-            直接复用 self.hps_model，不重新读取 checkpoint。
-        """
+        """首次创建 HPS ViT-H-14、加载 v2.1 checkpoint/tokenizer，并将模型保留在 CPU 复用。"""
         if self.hps_model is not None:
             return
 
         print("[Evaluator] Loading HPS v2.1 model/checkpoint once on CPU...")
 
         from hpsv2.src.open_clip import (
-            create_model_and_transforms as hps_create_model_and_transforms,
-            get_tokenizer as hps_get_tokenizer,
+            create_model_and_transforms as hps_create_model_and_transforms, get_tokenizer as hps_get_tokenizer
         )
 
         self.hps_model, _, self.hps_preprocess = hps_create_model_and_transforms(
@@ -520,15 +377,7 @@ class BrushNetValidationEvaluator:
         gc.collect()
 
     def _calculate_hps_batch(self, samples):
-        """
-        优化后的 HPS v2.1:
-
-        - 不调用 hpsv2.score()
-        - checkpoint 只加载一次
-        - 当前 full validation: CPU -> GPU -> 所有 HPS 样本 -> CPU
-        - 后续 full validation 复用 CPU 中的模型
-        - 相同 prompt 分组，再按 hps_batch_size 分块控制 ViT-H-14 显存峰值
-        """
+        """HPS v2.1：checkpoint 仅加载一次；按 prompt 分组并以 hps_batch_size 分块推理。"""
         self._load_hps_model()
 
         grouped = defaultdict(list)
@@ -550,28 +399,15 @@ class BrushNetValidationEvaluator:
                         image_features = text_features = chunk_scores_cpu = None
 
                         try:
-                            image_tensors = [
-                                self.hps_preprocess(image.convert("RGB"))
-                                for _, image in chunk
-                            ]
+                            image_tensors = [self.hps_preprocess(image.convert("RGB")) for _, image in chunk]
 
-                            image_batch = torch.stack(image_tensors, dim=0).to(
-                                self.device,
-                                non_blocking=True,
-                            )
+                            image_batch = torch.stack(image_tensors, dim=0).to(self.device, non_blocking=True)
 
                             # 每张图对应同一个 prompt，与官方逐图 hpsv2.score() 语义一致。
-                            text_batch = self.hps_tokenizer([prompt] * len(chunk)).to(
-                                self.device,
-                                non_blocking=True,
-                            )
+                            text_batch = self.hps_tokenizer([prompt] * len(chunk)).to(self.device, non_blocking=True)
 
                             # HPS 官方 CUDA 推理使用 autocast。
-                            amp_ctx = (
-                                torch.autocast("cuda")
-                                if self.device.type == "cuda"
-                                else contextlib.nullcontext()
-                            )
+                            amp_ctx = torch.autocast("cuda") if self.device.type == "cuda" else contextlib.nullcontext()
 
                             with amp_ctx:
                                 outputs = self.hps_model(image_batch, text_batch)
@@ -582,9 +418,7 @@ class BrushNetValidationEvaluator:
                                 # 每个 image 与同 index text 配对，所以取 diagonal。
                                 chunk_scores = torch.diagonal(logits_per_image)
 
-                            chunk_scores_cpu = (
-                                chunk_scores.float().detach().cpu().tolist()
-                            )
+                            chunk_scores_cpu = chunk_scores.float().detach().cpu().tolist()
 
                             for (item_index, _), score in zip(chunk, chunk_scores_cpu):
                                 results[item_index] = float(score)
@@ -607,68 +441,28 @@ class BrushNetValidationEvaluator:
 
         return results
 
-    # Public API ===============================================================
-
+    # Public API
     def evaluate(self, gt_image, pred_image, mask_image, prompt=None, full=False):
-        """
-        单张接口。
-
-        full=False:
-            PSNR
-            LPIPS
-            MSE
-
-        full=True:
-            7 个指标
-
-        单张也走 evaluate_batch()，因此 offload=True 时不会留下 GPU metric model。
-        """
-        sample = {
-            "gt_image": gt_image,
-            "pred_image": pred_image,
-            "mask_image": mask_image,
-            "prompt": prompt,
-        }
+        """单张评价接口；full=False 返回 3 个 preservation metrics，full=True 返回 7 个指标。"""
+        sample = {"gt_image": gt_image, "pred_image": pred_image, "mask_image": mask_image, "prompt": prompt}
         return self.evaluate_batch([sample], full=full)
 
     def evaluate_batch(self, samples, full=False):
-        """
-        推荐训练 validation 使用。
-
-        samples:
-            [
-                {
-                    "gt_image": PIL.Image,
-                    "pred_image": PIL.Image,
-                    "mask_image": PIL.Image,
-                    "prompt": str,
-                },
-                ...
-            ]
-
-        full=False:
-            PSNR / LPIPS / MSE
-
-        full=True:
-            ImageReward / HPS / Aesthetic / PSNR / LPIPS / MSE / CLIP
-        """
+        """批量评价接口；samples 每项包含 gt_image/pred_image/mask_image/prompt。"""
         if len(samples) == 0:
             raise ValueError("samples cannot be empty")
 
         if full and any(sample.get("prompt") is None for sample in samples):
             raise ValueError("full=True requires `prompt` for every sample.")
 
-        # CPU: MSE / PSNR preparation -----------------------------------------
+        # CPU: MSE / PSNR preparation
         prepared = []
         mse_scores = []
         psnr_scores = []
 
         for sample in samples:
             gt, pred = self._prepare_images(sample["gt_image"], sample["pred_image"])
-            preserve_mask = self._prepare_preserve_mask(
-                sample["mask_image"],
-                sample["gt_image"].size,
-            )
+            preserve_mask = self._prepare_preserve_mask(sample["mask_image"], sample["gt_image"].size)
 
             mse = self._calculate_mse(gt, pred, preserve_mask)
             psnr = self._calculate_psnr(mse)
@@ -677,7 +471,7 @@ class BrushNetValidationEvaluator:
             mse_scores.append(mse)
             psnr_scores.append(psnr)
 
-        # LPIPS: CPU -> GPU -> 所有图片 -> CPU -------------------------------
+        # LPIPS: CPU -> GPU -> 所有图片 -> CPU
         lpips_scores = []
 
         try:
@@ -685,13 +479,11 @@ class BrushNetValidationEvaluator:
             self._lpips_to_gpu()
 
             for gt, pred, preserve_mask in prepared:
-                lpips_scores.append(
-                    self._calculate_lpips_one(gt, pred, preserve_mask)
-                )
+                lpips_scores.append(self._calculate_lpips_one(gt, pred, preserve_mask))
         finally:
             self._lpips_to_cpu()
 
-        # Light result ---------------------------------------------------------
+        # Light result
         result = {
             "PSNR": float(np.mean(psnr_scores)),
             "LPIPS": float(np.mean(lpips_scores)),
@@ -702,14 +494,7 @@ class BrushNetValidationEvaluator:
         if not full:
             return result
 
-        # FULL METRICS ---------------------------------------------------------
-        # 顺序:
-        # CLIP GPU -> CPU
-        # Aesthetic GPU -> CPU
-        # ImageReward GPU -> CPU
-        # HPS GPU -> CPU
-        #
-        # offload=True 时各评价模型不会同时常驻 GPU。
+        # Full metrics：CLIP -> Aesthetic -> ImageReward -> HPS；offload=True 时不会同时常驻 GPU。
         clip_scores = self._calculate_clip_batch(samples)
         aesthetic_scores = self._calculate_aesthetic_batch(samples)
         image_reward_scores = self._calculate_image_reward_batch(samples)
@@ -726,22 +511,10 @@ class BrushNetValidationEvaluator:
             "CLIP Similarity": float(np.mean(clip_scores)),
         }
 
-    # TensorBoard ==============================================================
-
+    # TensorBoard
     @staticmethod
     def log_tensorboard(writer, metrics, step, prefix="validation"):
-        """
-        写 TensorBoard scalar。
-
-        示例:
-            validation/PSNR
-            validation/LPIPS
-            validation/MSE
-            validation/ImageReward
-            validation/HPS_V2.1
-            validation/Aesthetic
-            validation/CLIP
-        """
+        """将指标写入 TensorBoard scalar。"""
         tag_map = {
             "Image Reward": "ImageReward↑",
             "HPS V2.1": "HPS_V2.1↑",
@@ -755,15 +528,9 @@ class BrushNetValidationEvaluator:
         for key, value in metrics.items():
             writer.add_scalar(f"{prefix}/{tag_map.get(key, key)}", value, step)
 
-    # Debug ====================================================================
-
+    # Debug
     def print_devices(self):
-        """
-        检查 metric model 当前设备。
-
-        full evaluation 完成且 offload=True 时，
-        所有已经加载的模型都应该显示 cpu。
-        """
+        """打印已加载 metric model 的当前设备。"""
         models = {
             "LPIPS": self.lpips_metric,
             "CLIP": self.clip_metric,
@@ -777,42 +544,18 @@ class BrushNetValidationEvaluator:
                 print(f"{name}: {next(model.parameters()).device}")
 
     def print_cuda_memory(self, name=""):
-        """
-        查看当前 PyTorch CUDA 显存。
-
-        allocated:
-            当前真实被 Tensor/model 使用的显存。
-log_tensorboard
-        reserved:
-            PyTorch CUDA allocator 保留的缓存显存。
-
-        判断是否有模型没有释放时重点看 allocated。
-        """
+        """打印 CUDA allocated/reserved 显存；判断模型是否释放时重点看 allocated。"""
         if not torch.cuda.is_available():
             return
 
         allocated = torch.cuda.memory_allocated(self.device) / 1024**3
         reserved = torch.cuda.memory_reserved(self.device) / 1024**3
 
-        print(
-            f"[CUDA] {name}: allocated={allocated:.3f} GB, "
-            f"reserved={reserved:.3f} GB"
-        )
+        print(f"[CUDA] {name}: allocated={allocated:.3f} GB, reserved={reserved:.3f} GB")
 
-    # Cleanup ==================================================================
-
+    # Cleanup
     def unload_heavy_models(self):
-        """
-        彻底释放 heavy metrics，包括 CPU RAM。
-
-        注意:
-            训练期间不建议每次 full validation 后调用，
-            否则下次会重新加载 CLIP/Aesthetic/ImageReward/HPS。
-
-        推荐:
-            训练期间只让 evaluator 自动 GPU -> CPU；
-            整个训练结束时由 close() 调用。
-        """
+        """彻底释放 heavy metrics；训练期间通常只 offload 到 CPU，结束时再调用。"""
         if self.clip_metric is not None:
             try:
                 self.clip_metric = self.clip_metric.cpu()
@@ -857,14 +600,7 @@ log_tensorboard
         self._clear_cuda()
 
     def close(self):
-        """
-        训练结束时调用。
-
-        LPIPS -> CPU
-        heavy metrics -> CPU -> 删除引用
-        gc.collect()
-        torch.cuda.empty_cache()
-        """
+        """训练结束时将 metric 模型移回 CPU、删除 heavy model 引用并清理缓存。"""
         if self.lpips_metric is not None:
             try:
                 self.lpips_metric = self.lpips_metric.cpu()
