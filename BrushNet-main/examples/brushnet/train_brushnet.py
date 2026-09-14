@@ -1478,6 +1478,7 @@ def main(args):
         if name.endswith(".tar")
     )
 
+    # tar_files = tar_files[540:]# 从500开始
     train_dataset_len = SAMPLES_PER_TAR * len(tar_files)
     train_dataset = load_dataset(
         "webdataset",
@@ -1801,7 +1802,7 @@ def main(args):
                         )
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
+            progress_bar.set_postfix(**logs, refresh=False) #不能刷新不然可能会出很多条
             accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
