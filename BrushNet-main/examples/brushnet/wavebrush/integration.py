@@ -172,3 +172,12 @@ def append_jsonl(path,row):
     path.parent.mkdir(parents=True,exist_ok=True)
     with path.open('a') as f:
         f.write(json.dumps(row,ensure_ascii=False)+'\n')
+
+def conditioning_scale_kwargs(pipe, value):
+    # Official and historical local pipeline signatures use different parameter names.
+    import inspect
+    parameters = inspect.signature(pipe.__call__).parameters
+    for name in ('brushnet_conditioning_scale', 'paintingnet_conditioning_scale'):
+        if name in parameters:
+            return {name: float(value)}
+    raise ValueError('Pipeline has no supported BrushNet conditioning-scale argument')

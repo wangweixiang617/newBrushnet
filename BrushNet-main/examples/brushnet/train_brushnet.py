@@ -12,14 +12,12 @@ import shutil
 from pathlib import Path
 import json
 import cv2
-import imgaug.augmenters as iaa
 
 import accelerate
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from torch.utils.data import Dataset
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -28,7 +26,6 @@ from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image, ImageDraw
-from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
@@ -47,7 +44,7 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
-from validation_evaluator import BrushNetValidationEvaluator
+from wavebrush.validation_evaluator import BrushNetValidationEvaluator
 
 if is_wandb_available():
     import wandb

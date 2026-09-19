@@ -1,5 +1,6 @@
 from wavebrush.core import WaveConditioner
-from wavebrush.integration import wave_inference
+from wavebrush.integration import wave_inference, conditioning_scale_kwargs
+import gc
 import argparse
 import json
 import math
@@ -134,13 +135,36 @@ parser.add_argument("--paintingnet_conditioning_scale", type=float, default=1.0)
 parser.add_argument("--batch_size", type=int, default=4)
 parser.add_argument("--wave_path", type=str, default=None, help="Wave folder; default: brushnet_ckpt_path/wave")
 parser.add_argument("--disable_wave", action="store_true", help="Evaluate original BrushNet baseline")
+parser.add_argument('--seed', type=int, default=1234)
+parser.add_argument('--num_inference_steps', type=int, default=50)
+parser.add_argument('--guidance_scale', type=float, default=7.5)
+parser.add_argument('--metric_ckpt_path', default='data/ckpt')
+parser.add_argument('--drop_bands', nargs='*', choices=['H1','H2','H3','L3'], default=[])
+parser.add_argument('--drop_scales', nargs='*', type=int, choices=[0,1,2,3], default=[])
+parser.add_argument('--drop_interval', nargs=2, type=float)
+parser.add_argument('--gate_override', type=float)
+parser.add_argument('--wave_strength', type=float, default=1.)
+parser.add_argument('--trace_wave', action='store_true')
+parser.add_argument('--overwrite', action='store_true', help='Regenerate images in this experiment directory')
 args = parser.parse_args()
+if args.batch_size < 1 or args.num_inference_steps < 1:
+    raise ValueError('batch_size and num_inference_steps must be positive')
+if args.drop_interval and not 0 <= args.drop_interval[0] <= args.drop_interval[1] <= 1:
+    raise ValueError('drop_interval requires 0 <= lo <= hi <= 1')
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 base_model_path = args.base_model_path
 brushnet_path = args.brushnet_ckpt_path
 wave = None if args.disable_wave else WaveConditioner.from_pretrained(
     args.wave_path or os.path.join(brushnet_path, "wave"), device).eval()
+
+if wave is not None:
+    wave.drop_bands = {['H1','H2','H3','L3'].index(b) for b in args.drop_bands}
+    wave.drop_scales = set(args.drop_scales)
+    wave.drop_interval = args.drop_interval
+    wave.strength = args.wave_strength
+    if args.gate_override is not None:
+        wave.gate_override = torch.full((4,4), args.gate_override, device=device)
 
 brushnet = BrushNetModel.from_pretrained(brushnet_path, torch_dtype=torch.float16).to(device)
 pipe = StableDiffusionBrushNetPipeline.from_pretrained(
@@ -165,6 +189,14 @@ with open(args.mapping_file, "r") as f:
 
 mapping_items = list(mapping_file.items())
 batch_size = args.batch_size
+os.makedirs(args.image_save_path, exist_ok=True)
+# Do not silently mix different experiment settings in the same output directory.
+from pathlib import Path
+protocol_path = Path(args.image_save_path) / 'evaluation_config.json'
+protocol = {k:v for k,v in vars(args).items() if k != 'overwrite'}
+if protocol_path.exists() and not args.overwrite and json.loads(protocol_path.read_text()) != protocol:
+    raise ValueError('Output configuration differs; choose a new image_save_path or --overwrite')
+protocol_path.write_text(json.dumps(protocol, indent=2, ensure_ascii=False))
 
 for batch_start in range(0, len(mapping_items), batch_size):
     batch_items = mapping_items[batch_start:batch_start + batch_size]
@@ -172,6 +204,10 @@ for batch_start in range(0, len(mapping_items), batch_size):
     captions, init_images, mask_images = [], [], []
     save_paths, masked_image_save_paths = [], []
 
+    batch_complete = all(os.path.exists(os.path.join(args.image_save_path, item['image'])) and
+                         os.path.exists(os.path.splitext(os.path.join(args.image_save_path, item['image']))[0] + '_masked' + os.path.splitext(item['image'])[1])
+                         for _, item in batch_items)
+    # A partially cached batch is regenerated as a whole for stable VAE RNG ordering.
     # 准备一个 batch
     for key, item in batch_items:
         image_path = item["image"]
@@ -183,7 +219,7 @@ for batch_start in range(0, len(mapping_items), batch_size):
         masked_image_save_path = root + "_masked" + ext
 
         # 已经生成过则跳过
-        if os.path.exists(save_path) and os.path.exists(masked_image_save_path):
+        if not args.overwrite and batch_complete:
             print(f"image {key} exists! skip...")
             continue
 
@@ -220,20 +256,25 @@ for batch_start in range(0, len(mapping_items), batch_size):
     print(f"generating batch: {batch_keys[0]} -> {batch_keys[-1]} (batch size = {len(batch_keys)})")
 
     # 每张图一个固定 seed generator
-    generators = [torch.Generator(device=device).manual_seed(1234) for _ in range(len(batch_keys))]
+    generators = [torch.Generator(device=device).manual_seed(args.seed) for _ in range(len(batch_keys))]
 
     # Batch inference
-    with torch.no_grad(), wave_inference(pipe.brushnet, wave, init_images, mask_images):
+    # Official pipeline VAE sampling also consumes the global torch RNG.
+    torch.manual_seed(args.seed)
+    trace = [] if args.trace_wave else None
+    with torch.no_grad(), wave_inference(pipe.brushnet, wave, init_images, mask_images, trace=trace):
         result = pipe(
             captions,
             init_images,
             mask_images,
             num_inference_steps=50,
             generator=generators,
-            paintingnet_conditioning_scale=args.paintingnet_conditioning_scale,
+            **conditioning_scale_kwargs(pipe, args.paintingnet_conditioning_scale),
         )
     print(f"{batch_keys[0]} -> {batch_keys[-1]}: nsfw =", result.nsfw_content_detected)
     images = result.images
+    if trace is not None:
+        Path(args.image_save_path, f'wave_trace_{batch_start:06d}.json').write_text(json.dumps(trace))
 
     # 保存 batch 中每一张图片
     for key, item, image, init_image, save_path, masked_image_save_path in zip(
@@ -260,6 +301,12 @@ for batch_start in range(0, len(mapping_items), batch_size):
         image.save(save_path)
         init_image.save(masked_image_save_path)
         print(f"saved image {key}")
+
+# Release generation models before loading all metric networks.
+del pipe, brushnet, wave
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 # Evaluation
 evaluation_df = pd.DataFrame(

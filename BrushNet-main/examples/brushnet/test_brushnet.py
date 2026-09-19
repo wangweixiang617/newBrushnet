@@ -83,7 +83,7 @@ if blended:
 
 image.save("output.png")
 # mask_image.save("mask.png")
-from validation_evaluator import BrushNetValidationEvaluator
+from wavebrush.validation_evaluator import BrushNetValidationEvaluator
 device = "cuda" if torch.cuda.is_available() else "cpu"
 evaluator = BrushNetValidationEvaluator(
     device=device,

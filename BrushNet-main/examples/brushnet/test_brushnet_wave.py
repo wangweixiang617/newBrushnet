@@ -60,6 +60,7 @@ mask_image = Image.fromarray(mask_image.astype(np.uint8).repeat(3,-1)*255).conve
 
 generator = torch.Generator("cuda").manual_seed(1234)
 
+torch.manual_seed(1234)  # Also controls VAE condition sampling in the official pipeline.
 with torch.no_grad(), wave_inference(pipe.brushnet, wave, [init_image], [mask_image]):
     image = pipe(
         caption, 
@@ -90,7 +91,7 @@ if blended:
 
 image.save("output.png")
 # mask_image.save("mask.png")
-from validation_evaluator import BrushNetValidationEvaluator
+from wavebrush.validation_evaluator import BrushNetValidationEvaluator
 device = "cuda" if torch.cuda.is_available() else "cpu"
 evaluator = BrushNetValidationEvaluator(
     device=device,

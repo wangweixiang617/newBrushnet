@@ -185,7 +185,7 @@ def main(evaluate=False):
         raise ValueError('Evaluation manifest differs from generated ids')
     evaluator = None
     if a.metrics in ('light','full'):
-        from ..validation_evaluator_wave import BrushNetValidationEvaluator
+        from .local_evaluator import BrushNetValidationEvaluator
         evaluator = BrushNetValidationEvaluator(acc.device, ckpt_path=a.metric_ckpt_path, offload=True)
     evaluated = []
     try:

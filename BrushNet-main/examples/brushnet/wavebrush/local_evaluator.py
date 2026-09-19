@@ -1,5 +1,5 @@
 """Rank-0 validation adapter; original validation_evaluator.py is unchanged."""
-from ..validation_evaluator import BrushNetValidationEvaluator as OriginalEvaluator
+from .validation_evaluator import BrushNetValidationEvaluator as OriginalEvaluator
 
 
 def _no_distributed():

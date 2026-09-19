@@ -2,7 +2,6 @@
 # coding=utf-8
 
 import argparse
-import contextlib
 import gc
 import logging
 import math
@@ -12,14 +11,11 @@ import shutil
 from pathlib import Path
 import json
 import cv2
-import imgaug.augmenters as iaa
 
-import accelerate
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from torch.utils.data import Dataset
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -28,7 +24,6 @@ from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image, ImageDraw
-from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
@@ -47,7 +42,7 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
-from validation_evaluator import BrushNetValidationEvaluator
+from wavebrush.validation_evaluator import BrushNetValidationEvaluator
 from wavebrush.integration import add_wave_args, build_wave, wave_inference
 from wavebrush.core import merge_residuals
 from wavebrush.rms import RMSAccumulator, initialize_rms_from_loader
@@ -123,6 +118,7 @@ def log_validation_evaluator(
         pipeline.enable_xformers_memory_efficient_attention()
 
     # Validation 固定 seed，便于不同 checkpoint 对比
+    torch.manual_seed(1234)  # validation_guard restores training RNG afterward.
     generator = torch.Generator(device=accelerator.device).manual_seed(1234)
 
     # Validation data
@@ -976,6 +972,8 @@ def parse_args(input_args=None):
 
     if args.resolution % 64 or args.rms_init_batches < 1:
         raise ValueError('Wave resolution must be divisible by 64; rms_init_batches must be positive')
+    if not args.train_brushnet and not args.brushnet_model_name_or_path:
+        raise ValueError('--freeze_brushnet requires pretrained BrushNet weights')
     if args.wave_preset == 'B0' and not args.train_brushnet:
         raise ValueError('B0 with frozen BrushNet has no trainable parameters')
     if args.disable_validation:
@@ -984,10 +982,11 @@ def parse_args(input_args=None):
 
 
 class MyWebDataset():
-    def __init__(self,resolution,tokenizer,random_mask):
+    def __init__(self,resolution,tokenizer,random_mask,proportion_empty_prompts=0.):
         self.resolution = resolution
         self.tokenizer = tokenizer
         self.random_mask = random_mask
+        self.proportion_empty_prompts = proportion_empty_prompts
 
     def random_brush_gen(
         self,
@@ -1064,7 +1063,7 @@ class MyWebDataset():
         return img.reshape(shape, order='F')
 
     def tokenize_captions(self, caption, is_train=True):
-        if random.random() < args.proportion_empty_prompts:
+        if random.random() < self.proportion_empty_prompts:
             caption=""
         elif isinstance(caption, str):
             caption=caption
@@ -1073,7 +1072,7 @@ class MyWebDataset():
             caption=random.choice(caption) if is_train else caption[0]
         else:
             raise ValueError(
-                f"Caption column `{caption_column}` should contain either strings or lists of strings."
+                "Caption should contain a string or list of strings."
             )
         inputs = self.tokenizer(
             caption, max_length=self.tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
@@ -1481,6 +1480,8 @@ def main(args):
     )
 
     # tar_files = tar_files[540:]# 从500开始
+    if not tar_files:
+        raise ValueError("No .tar files found in train_data_dir")
     train_dataset_len = SAMPLES_PER_TAR * len(tar_files)
     train_dataset = load_dataset(
         "webdataset",
@@ -1496,7 +1497,7 @@ def main(args):
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=False,
-        collate_fn=MyWebDataset(resolution = args.resolution, tokenizer=tokenizer,random_mask=args.random_mask),
+        collate_fn=MyWebDataset(resolution = args.resolution, tokenizer=tokenizer,random_mask=args.random_mask,proportion_empty_prompts=args.proportion_empty_prompts),
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
@@ -1505,7 +1506,7 @@ def main(args):
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(train_dataloader_len / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(train_dataloader_len / accelerator.num_processes / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -1564,6 +1565,11 @@ def main(args):
 
         tracker_config = {k: json.dumps(v) if isinstance(v, (list, dict)) else v for k, v in tracker_config.items()}
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
+        from wavebrush.reporting import parameter_report
+        report = parameter_report(unwrap_model(wave) if wave is not None else None, unwrap_model(brushnet))
+        report.update(world_size=accelerator.num_processes, effective_batch=args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps)
+        Path(args.output_dir, 'parameter_report.json').write_text(json.dumps(report, indent=2))
+        Path(args.output_dir, 'run_config.json').write_text(json.dumps(tracker_config, indent=2))
 
     validation_evaluator = None
     if (accelerator.is_main_process and args.enable_validation_metrics):
@@ -1664,6 +1670,7 @@ def main(args):
                     resolution=args.resolution,
                     tokenizer=tokenizer,
                     random_mask=args.random_mask,
+                    proportion_empty_prompts=args.proportion_empty_prompts,
                 ),
                 batch_size=args.train_batch_size,
                 num_workers=args.dataloader_num_workers,
@@ -1672,6 +1679,9 @@ def main(args):
             resume_dataloader = accelerator.prepare(resume_dataloader)
     else:
         initial_global_step = 0
+
+    if not args.resume_from_checkpoint and args.seed is not None:
+        set_seed(args.seed)  # Decouple training RNG from adapter parameter initialization.
 
     # Short extra pass over the ORIGINAL streaming loader. Loaded RMS is never overwritten.
     initialize_rms_from_loader(
@@ -1689,6 +1699,8 @@ def main(args):
 
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
+        if global_step >= args.max_train_steps:
+            break
         # Resume 的第一个 epoch 使用定位后的 tar，之后恢复完整数据集
         if epoch == first_epoch and resume_dataloader is not None:
             active_dataloader = resume_dataloader
@@ -1742,7 +1754,7 @@ def main(args):
                 )
 
                 if wave is not None:
-                    extra = wave(batch['conditioning_pixel_values'], 1-batch['masks'], timesteps)
+                    extra = wave(batch['conditioning_pixel_values'], 1-batch['masks'], timesteps, encoder_hidden_states=encoder_hidden_states)
                     down_block_res_samples, mid_block_res_sample, up_block_res_samples = merge_residuals(
                         (down_block_res_samples, mid_block_res_sample, up_block_res_samples), extra)
                     rms_accumulator.add(batch['pixel_values'])
@@ -1815,6 +1827,8 @@ def main(args):
                     accelerator.wait_for_everyone()
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     accelerator.save_state(save_path)
+                    if accelerator.is_main_process and not args.train_brushnet:
+                        unwrap_model(brushnet).save_pretrained(Path(save_path) / 'brushnet')
                     accelerator.wait_for_everyone()
                     logger.info(f"Saved state to {save_path}")
 
@@ -1838,7 +1852,19 @@ def main(args):
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs, refresh=False) #不能刷新不然可能会出很多条
-            accelerator.log(logs, step=global_step)
+            if accelerator.sync_gradients:
+                if wave is not None and args.wave_log_every > 0 and global_step % args.wave_log_every == 0:
+                    raw = unwrap_model(wave)
+                    logs.update({f'wave/rms_{i}': float(v) for i, v in enumerate(raw.band_rms)})
+                    logs['wave/rms_updates'] = int(raw.rms_updates)
+                    with torch.no_grad():
+                        #for t in (0, noise_scheduler.config.num_train_timesteps // 2, noise_scheduler.config.num_train_timesteps - 1):
+                        T = noise_scheduler.config.num_train_timesteps
+                        n = 10
+                        for t in [i * T // n for i in range(n)] + [T - 1]:
+                            gates = raw.effective_gates(torch.tensor([t], device=accelerator.device))[0]
+                            logs.update({f'wave/gate_t{t}_b{b}_s{s}': float(gates[b, s]) for b in range(4) for s in range(4)})
+                accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break
