@@ -12,7 +12,7 @@ import shutil
 from pathlib import Path
 import json
 import cv2
-
+from datetime import datetime
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -263,6 +263,15 @@ def log_validation_evaluator(
 
         metric_string = ", ".join(f"{k}={v:.6f}" for k, v in validation_metrics.items())
         logger.info(f"Validation metrics at step {step}: {metric_string}")
+        #输出到文件里面
+        metrics_file = Path(args.output_dir) / "validation_metrics.txt"
+        timestamp = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+        with metrics_file.open("a", encoding="utf-8",) as f:
+            f.write(
+                f"{timestamp} - "
+                f"Validation metrics at step {step}: "
+                f"{metric_string}\n"
+            )
 
     # TensorBoard / WandB
     tracker_key = "test" if is_final_validation else "validation"

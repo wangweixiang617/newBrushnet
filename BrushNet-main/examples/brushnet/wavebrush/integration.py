@@ -166,8 +166,13 @@ def residual_stats(base,extra):
     for i,(b,w) in enumerate(zip(base,extra)):
         bf,wf=b.detach().float(),w.detach().float()
         br,wr=bf.square().mean().sqrt().item(),wf.square().mean().sqrt().item()
+        cross = (bf * wf).mean().item()
+        cosine = torch.nn.functional.cosine_similarity(bf.reshape(1, -1), wf.reshape(1, -1),).item()
+        merged = bf + wf
+        merged_rms = merged.square().mean().sqrt().item()
         rows.append(dict(slot=i,shape=list(b.shape),brush_rms=br,wave_rms=wr,wave_mean=wf.mean().item(),
-                         wave_abs_max=wf.abs().max().item(),ratio=wr/max(br,1e-8)))
+                         wave_abs_max=wf.abs().max().item(),ratio=wr/max(br,1e-8), cross_mean=cross,
+                            cosine=cosine,merged_rms=merged_rms,))
     return rows
 
 
