@@ -503,6 +503,19 @@ def parse_args(input_args=None):
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
+        "--brushnet_learning_rate",
+        type=float,
+        default=None,
+        help="Learning rate for BrushNet. If None, use --learning_rate.",
+    )
+
+    parser.add_argument(
+        "--wave_learning_rate",
+        type=float,
+        default=None,
+        help="Learning rate for WaveConditioner. If None, use --learning_rate.",
+    )
+    parser.add_argument(
         "--scale_lr",
         action="store_true",
         default=False,
@@ -1218,10 +1231,13 @@ def main(args):
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
+    brushnet_lr = args.brushnet_learning_rate if args.brushnet_learning_rate is not None else args.learning_rate
+    wave_lr = args.wave_learning_rate if args.wave_learning_rate is not None else args.learning_rate
     if args.scale_lr:
-        args.learning_rate = (
-            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
-        )
+        lr_scale = args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+        brushnet_lr *= lr_scale
+        wave_lr *= lr_scale
+
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
     if args.use_8bit_adam:
@@ -1236,27 +1252,48 @@ def main(args):
     else:
         optimizer_class = torch.optim.AdamW
 
-    # Optimizer creation
-    params_to_optimize = list(brushnet.parameters()) if args.train_brushnet else []
+    # ---------------------------------------------------------
+    # Optimizer creation: separate LR for BrushNet and Wave
+    # ---------------------------------------------------------
+    optimizer_groups = []
+    optimizer_group_names = []
+
+    # 保留一个平铺后的 parameter list，
+    # 后面 accelerator.clip_grad_norm_() 仍然用这个。
+    params_to_optimize = []
+    if args.train_brushnet:
+        brushnet_params = [p for p in brushnet.parameters() if p.requires_grad]
+        optimizer_groups.append({ "params": brushnet_params, "lr": brushnet_lr,})
+        optimizer_group_names.append("brushnet")
+        params_to_optimize.extend(brushnet_params)
     if wave is not None:
-        params_to_optimize += list(wave.parameters())
+        wave_params = [p for p in wave.parameters() if p.requires_grad]
+        optimizer_groups.append({ "params": wave_params,"lr": wave_lr,})
+        optimizer_group_names.append("wave")
+        params_to_optimize.extend(wave_params)
+
+    if not optimizer_groups:
+        raise ValueError("No trainable parameters.")
     optimizer = optimizer_class(
-        params_to_optimize,
+        optimizer_groups,
+        # 每个 group 已经显式指定 lr；
+        # 这里仅作为 optimizer 默认值。
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
+    logger.info(
+        "Optimizer groups: %s",
+        ", ".join(
+            f"{name}={group['lr']:.3e}"
+            for name, group in zip(
+                optimizer_group_names,
+                optimizer.param_groups,
+            )
+        ),
+    )
 
-    # train_dataset = make_train_dataset(args, tokenizer, accelerator)
-
-    # train_dataloader = torch.utils.data.DataLoader(
-    #     train_dataset,
-    #     shuffle=True,
-    #     collate_fn=collate_fn,
-    #     batch_size=args.train_batch_size,
-    #     num_workers=args.dataloader_num_workers,
-    # )
 
     # 固定 tar 顺序，只统计 .tar
     SAMPLES_PER_TAR = 10000
@@ -1357,6 +1394,19 @@ def main(args):
         report.update(world_size=accelerator.num_processes, effective_batch=args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps)
         Path(args.output_dir, 'parameter_report.json').write_text(json.dumps(report, indent=2))
         Path(args.output_dir, 'run_config.json').write_text(json.dumps(tracker_config, indent=2))
+
+    #添加多线模式
+    T = noise_scheduler.config.num_train_timesteps
+    n = 3
+    wave_log_ts = [i * T // n for i in range(n)] + [T - 1]
+    if accelerator.is_main_process:
+        writer = accelerator.get_tracker("tensorboard", unwrap=True)
+        writer.add_custom_scalars({
+            "Wave Gates": {
+                f"t{t}_band{b}": ["Multiline", [f"wave_gate/gate_t{t}_b{b}_s{s}" for s in range(4)]]
+                for t in wave_log_ts for b in range(4)
+            }
+        })
 
     validation_evaluator = None
     if (accelerator.is_main_process and args.enable_validation_metrics):
@@ -1660,20 +1710,29 @@ def main(args):
                         )
                     accelerator.wait_for_everyone()
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs, refresh=False) #不能刷新不然可能会出很多条
+            # --------------------------------------------------
+            # Basic training logs
+            # --------------------------------------------------
+            current_lrs = lr_scheduler.get_last_lr()
+            logs = {"loss": loss.detach().float().item(),}
+            for name, lr in zip(optimizer_group_names, current_lrs):
+                logs[f"{name}_lr"] = lr
+            # Progress bar
+            progress_bar.set_postfix(**logs, refresh=False,)#不能刷新不然可能会出很多条
+
+            # TensorBoard
             if accelerator.sync_gradients:
                 if wave is not None and args.wave_log_every > 0 and global_step % args.wave_log_every == 0:
                     raw = unwrap_model(wave)
-                    logs.update({f'wave/rms_{i}': float(v) for i, v in enumerate(raw.band_rms)})
-                    logs['wave/rms_updates'] = int(raw.rms_updates)
+                    logs.update({f'wave_rms/rms_{i}': float(v) for i, v in enumerate(raw.band_rms)})
+                    logs['wave_rms/rms_updates'] = int(raw.rms_updates)
                     with torch.no_grad():
-                        #for t in (0, noise_scheduler.config.num_train_timesteps // 2, noise_scheduler.config.num_train_timesteps - 1):
-                        T = noise_scheduler.config.num_train_timesteps
-                        n = 10
-                        for t in [i * T // n for i in range(n)] + [T - 1]:
+                        for t in wave_log_ts:
                             gates = raw.effective_gates(torch.tensor([t], device=accelerator.device))[0]
-                            logs.update({f'wave/gate_t{t}_b{b}_s{s}': float(gates[b, s]) for b in range(4) for s in range(4)})
+                            logs.update({
+                                f'wave_gate/gate_t{t}_b{b}_s{s}': float(gates[b, s])
+                                for b in range(4) for s in range(4)
+                            })
                 accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
