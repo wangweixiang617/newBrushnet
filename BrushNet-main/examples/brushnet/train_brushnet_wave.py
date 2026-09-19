@@ -1,0 +1,1907 @@
+#!/usr/bin/env python
+# coding=utf-8
+
+import argparse
+import contextlib
+import gc
+import logging
+import math
+import os
+import random
+import shutil
+from pathlib import Path
+import json
+import cv2
+import imgaug.augmenters as iaa
+
+import accelerate
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.utils.checkpoint
+from torch.utils.data import Dataset
+import transformers
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import ProjectConfiguration, set_seed
+from datasets import load_dataset
+from huggingface_hub import create_repo, upload_folder
+from packaging import version
+from PIL import Image, ImageDraw
+from torchvision import transforms
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer, PretrainedConfig
+
+import diffusers
+from diffusers import (
+    AutoencoderKL,
+    BrushNetModel,
+    DDPMScheduler,
+    StableDiffusionBrushNetPipeline,
+    UNet2DConditionModel,
+    UniPCMultistepScheduler,
+)
+from diffusers.optimization import get_scheduler
+from diffusers.utils import check_min_version, is_wandb_available
+from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
+from diffusers.utils.import_utils import is_xformers_available
+from diffusers.utils.torch_utils import is_compiled_module
+
+from validation_evaluator import BrushNetValidationEvaluator
+from wavebrush.integration import add_wave_args, build_wave, wave_inference
+from wavebrush.core import merge_residuals
+from wavebrush.rms import RMSAccumulator, initialize_rms_from_loader
+from wavebrush.runtime import register_model_hooks, validation_guard
+
+if is_wandb_available():
+    import wandb
+
+# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
+check_min_version("0.27.0.dev0")
+
+logger = get_logger(__name__)
+VALIDATIONCOUNTMAX: int = 24 #验证集最大数量
+
+def image_grid(imgs, rows, cols):
+    assert len(imgs) == rows * cols
+
+    w, h = imgs[0].size
+    grid = Image.new("RGB", size=(cols * w, rows * h))
+
+    for i, img in enumerate(imgs):
+        grid.paste(img, box=(i % cols * w, i // cols * h))
+    return grid
+@validation_guard
+def log_validation_evaluator(
+    vae,
+    text_encoder,
+    tokenizer,
+    unet,
+    brushnet,
+    args,
+    accelerator,
+    weight_dtype,
+    step,
+    validation_evaluator=None,
+    is_final_validation=False,
+    wave=None,
+):
+    logger.info("Running validation...")
+
+    if validation_evaluator is not None:
+        validation_evaluator.print_cuda_memory("Running validation")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # 当前 BrushNet
+    if not is_final_validation:
+        brushnet = accelerator.unwrap_model(brushnet)
+    else:
+        brushnet = BrushNetModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
+
+    # Validation pipeline
+    pipeline = StableDiffusionBrushNetPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        unet=unet,
+        brushnet=brushnet,
+        safety_checker=None,
+        feature_extractor=None,
+        requires_safety_checker=False,
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=weight_dtype,
+    )
+    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    if args.enable_xformers_memory_efficient_attention:
+        pipeline.enable_xformers_memory_efficient_attention()
+
+    # Validation 固定 seed，便于不同 checkpoint 对比
+    generator = torch.Generator(device=accelerator.device).manual_seed(1234)
+
+    # Validation data
+    if len(args.validation_image) == len(args.validation_prompt) == len(args.validation_mask):
+        validation_images = args.validation_image
+        validation_prompts = args.validation_prompt
+        validation_masks = args.validation_mask
+    else:
+        raise ValueError("The number of validation_image, validation_prompt and validation_mask must match.")
+
+    # 最多只取前 VALIDATIONCOUNTMAX 个
+    validation_items = list(zip(validation_prompts, validation_images, validation_masks))[:VALIDATIONCOUNTMAX]
+    image_logs, metric_samples = [], []
+    inference_ctx = accelerator.autocast()
+    validation_batch_size = max(1, getattr(args, "validation_batch_size", 4))
+
+    # 先把 validation 样本都准备好
+    prepared_samples = []
+    for validation_prompt, validation_image_path, validation_mask_path in validation_items:
+        # GT 原图必须保留，用于 PSNR / LPIPS / MSE
+        gt_image = Image.open(validation_image_path).convert("RGB")
+        mask_image = Image.open(validation_mask_path).convert("RGB")
+
+        # 白色 mask 区域变黑，生成 BrushNet conditioning image
+        conditioning_image = Image.composite(
+            Image.new("RGB", gt_image.size, (0, 0, 0)),
+            gt_image,
+            mask_image.convert("L"),
+        )
+
+        prepared_samples.append(
+            {
+                "prompt": validation_prompt,
+                "gt_image": gt_image,
+                "mask_image": mask_image,
+                "conditioning_image": conditioning_image,
+                "images": [],
+            }
+        )
+
+    # Validation 进度如：24 samples × 2 images = 48 images
+    total_validation_images = len(prepared_samples) * args.num_validation_images
+    batches_per_repeat = math.ceil(len(prepared_samples) / validation_batch_size)
+
+    validation_pbar = tqdm(
+        total=total_validation_images,
+        desc=f"Validation {step}",
+        unit="img",
+        disable=not accelerator.is_main_process,
+        leave=False,
+    )
+
+    # 按 repeat 生成，这样仍保留每个样本 num_validation_images 张输出的语义
+    for repeat_idx in range(args.num_validation_images):
+        for batch_idx, batch_start in enumerate(range(0, len(prepared_samples), validation_batch_size)):
+            batch_samples = prepared_samples[batch_start:batch_start + validation_batch_size]
+            batch_prompts = [sample["prompt"] for sample in batch_samples]
+            batch_conditioning_images = [sample["conditioning_image"] for sample in batch_samples]
+            batch_mask_images = [sample["mask_image"] for sample in batch_samples]
+
+            with torch.no_grad(), inference_ctx, wave_inference(
+                brushnet, wave, batch_conditioning_images, batch_mask_images
+            ):
+                batch_result = pipeline(
+                    batch_prompts,
+                    batch_conditioning_images,
+                    batch_mask_images,
+                    num_inference_steps=50,
+                    generator=generator,
+                )
+
+            for i, generated_image in enumerate(batch_result.images):
+                sample = batch_samples[i]
+                sample["images"].append(generated_image)
+
+                if validation_evaluator is not None:
+                    metric_samples.append(
+                        {
+                            "gt_image": sample["gt_image"].copy(),
+                            "pred_image": generated_image.copy(),
+                            "mask_image": sample["mask_image"].copy(),
+                            "prompt": sample["prompt"],
+                        }
+                    )
+
+            validation_pbar.set_postfix_str(
+                f"repeat {repeat_idx + 1}/{args.num_validation_images}, "
+                f"batch {batch_idx + 1}/{batches_per_repeat}"
+            )
+            validation_pbar.update(len(batch_samples))
+
+    validation_pbar.close()
+
+    # 整理 image_logs
+    for sample in prepared_samples:
+        image_logs.append(
+            {
+                "validation_image": sample["conditioning_image"],
+                "images": sample["images"],
+                "validation_prompt": sample["prompt"],
+            }
+        )
+
+    # Metric 前删除 validation pipeline，释放显存
+    del pipeline
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Metrics
+    validation_metrics = None
+    if validation_evaluator is not None and len(metric_samples) > 0:
+        # final validation 一定计算完整 7 个指标
+        run_full_metrics = is_final_validation
+
+        # 训练中每 N step 计算完整指标
+        if (
+            not run_full_metrics
+            and args.full_validation_metric_steps is not None
+            and args.full_validation_metric_steps > 0
+            and step % args.full_validation_metric_steps == 0
+        ):
+            run_full_metrics = True
+
+        validation_evaluator.print_cuda_memory("before metrics")
+        validation_metrics = validation_evaluator.evaluate_batch(metric_samples, full=run_full_metrics)
+        validation_evaluator.print_cuda_memory("after metrics")
+
+        metric_string = ", ".join(f"{k}={v:.6f}" for k, v in validation_metrics.items())
+        logger.info(f"Validation metrics at step {step}: {metric_string}")
+
+    # TensorBoard / WandB
+    tracker_key = "test" if is_final_validation else "validation"
+
+    for tracker in accelerator.trackers:
+        if tracker.name == "tensorboard":
+            # Images
+            for log in image_logs:
+                images = log["images"]
+                validation_prompt = log["validation_prompt"]
+                validation_image = log["validation_image"]
+
+                formatted_images = [np.asarray(validation_image)]
+                formatted_images.extend(np.asarray(image) for image in images)
+                formatted_images = np.stack(formatted_images)
+
+                tracker.writer.add_images(
+                    validation_prompt,
+                    formatted_images,
+                    step,
+                    dataformats="NHWC",
+                )
+
+            # Metrics
+            if validation_metrics is not None:
+                validation_evaluator.log_tensorboard(
+                    writer=tracker.writer,
+                    metrics=validation_metrics,
+                    step=step,
+                    prefix=tracker_key,
+                )
+
+        elif tracker.name == "wandb":
+            formatted_images = []
+
+            for log in image_logs:
+                images = log["images"]
+                validation_prompt = log["validation_prompt"]
+                validation_image = log["validation_image"]
+
+                formatted_images.append(wandb.Image(validation_image, caption="BrushNet conditioning"))
+
+                for image in images:
+                    formatted_images.append(wandb.Image(image, caption=validation_prompt))
+
+            tracker.log({tracker_key: formatted_images}, step=step)
+
+            if validation_metrics is not None:
+                tracker.log(
+                    {f"{tracker_key}/{k}": v for k, v in validation_metrics.items()},
+                    step=step,
+                )
+
+        else:
+            logger.warning(f"Image logging not implemented for {tracker.name}")
+
+    # 清理 validation 临时对象
+    metric_samples.clear()
+    prepared_samples.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return image_logs
+@validation_guard
+def log_validation(
+    vae, text_encoder, tokenizer, unet, brushnet, args, accelerator, weight_dtype, step, is_final_validation=False, wave=None
+):
+    logger.info("Running validation... ")
+
+    if not is_final_validation:
+        brushnet = accelerator.unwrap_model(brushnet)
+    else:
+        brushnet = BrushNetModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
+
+    pipeline = StableDiffusionBrushNetPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        unet=unet,
+        brushnet=brushnet,
+        safety_checker=None,
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=weight_dtype,
+    )
+    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    if args.enable_xformers_memory_efficient_attention:
+        pipeline.enable_xformers_memory_efficient_attention()
+
+    if args.seed is None:
+        generator = None
+    else:
+        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+
+    if len(args.validation_image) == len(args.validation_prompt) and len(args.validation_image) == len(args.validation_mask):
+        validation_images = args.validation_image
+        validation_prompts = args.validation_prompt
+        validation_masks = args.validation_mask
+    else:
+        raise ValueError(
+            "number of `args.validation_image`, `args.validation_mask`, and `args.validation_prompt` should be checked in `parse_args`"
+        )
+
+    image_logs = []
+    inference_ctx = accelerator.autocast()
+
+    for validation_prompt, validation_image, validation_mask in zip(validation_prompts, validation_images, validation_masks):
+        validation_image = Image.open(validation_image).convert("RGB")
+        validation_mask = Image.open(validation_mask).convert("RGB")
+        validation_image = Image.composite(Image.new('RGB', (validation_image.size[0], validation_image.size[1]), (0, 0, 0)), validation_image, validation_mask.convert("L"))
+
+        images = []
+
+        for _ in range(args.num_validation_images):
+            with torch.no_grad(), inference_ctx, wave_inference(
+                brushnet, wave, [validation_image], [validation_mask]
+            ):
+                image = pipeline(
+                    validation_prompt, validation_image, validation_mask, num_inference_steps=20, generator=generator
+                ).images[0]
+
+            images.append(image)
+
+        image_logs.append(
+            {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt}
+        )
+
+    tracker_key = "test" if is_final_validation else "validation"
+    for tracker in accelerator.trackers:
+        if tracker.name == "tensorboard":
+            for log in image_logs:
+                images = log["images"]
+                validation_prompt = log["validation_prompt"]
+                validation_image = log["validation_image"]
+
+                formatted_images = []
+
+                formatted_images.append(np.asarray(validation_image))
+
+                for image in images:
+                    formatted_images.append(np.asarray(image))
+
+                formatted_images = np.stack(formatted_images)
+
+                tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
+        elif tracker.name == "wandb":
+            formatted_images = []
+
+            for log in image_logs:
+                images = log["images"]
+                validation_prompt = log["validation_prompt"]
+                validation_image = log["validation_image"]
+
+                formatted_images.append(wandb.Image(validation_image, caption="BrushNet conditioning"))
+
+                for image in images:
+                    image = wandb.Image(image, caption=validation_prompt)
+                    formatted_images.append(image)
+
+            tracker.log({tracker_key: formatted_images})
+        else:
+            logger.warn(f"image logging not implemented for {tracker.name}")
+
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return image_logs
+
+
+def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
+    text_encoder_config = PretrainedConfig.from_pretrained(
+        pretrained_model_name_or_path,
+        subfolder="text_encoder",
+        revision=revision,
+    )
+    model_class = text_encoder_config.architectures[0]
+
+    if model_class == "CLIPTextModel":
+        from transformers import CLIPTextModel
+
+        return CLIPTextModel
+    elif model_class == "RobertaSeriesModelWithTransformation":
+        from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
+
+        return RobertaSeriesModelWithTransformation
+    else:
+        raise ValueError(f"{model_class} is not supported.")
+
+
+def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=None):
+    img_str = ""
+    if image_logs is not None:
+        img_str = "You can find some example images below.\n\n"
+        for i, log in enumerate(image_logs):
+            images = log["images"]
+            validation_prompt = log["validation_prompt"]
+            validation_image = log["validation_image"]
+            validation_image.save(os.path.join(repo_folder, "image_control.png"))
+            img_str += f"prompt: {validation_prompt}\n"
+            images = [validation_image] + images
+            image_grid(images, 1, len(images)).save(os.path.join(repo_folder, f"images_{i}.png"))
+            img_str += f"![images_{i})](./images_{i}.png)\n"
+
+    model_description = f"""
+# brushnet-{repo_id}
+
+These are brushnet weights trained on {base_model} with new type of conditioning.
+{img_str}
+"""
+    model_card = load_or_create_model_card(
+        repo_id_or_path=repo_id,
+        from_training=True,
+        license="creativeml-openrail-m",
+        base_model=base_model,
+        model_description=model_description,
+        inference=True,
+    )
+
+    tags = [
+        "stable-diffusion",
+        "stable-diffusion-diffusers",
+        "text-to-image",
+        "diffusers",
+        "brushnet",
+        "diffusers-training",
+    ]
+    model_card = populate_model_card(model_card, tags=tags)
+
+    model_card.save(os.path.join(repo_folder, "README.md"))
+
+
+def parse_args(input_args=None):
+    parser = argparse.ArgumentParser(description="Simple example of a BrushNet training script.")
+    parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--brushnet_model_name_or_path",
+        type=str,
+        default=None,
+        help="Path to pretrained brushnet model or model identifier from huggingface.co/models."
+        " If not specified brushnet weights are initialized from unet.",
+    )
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        required=False,
+        help="Revision of pretrained model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
+    )
+    parser.add_argument(
+        "--tokenizer_name",
+        type=str,
+        default=None,
+        help="Pretrained tokenizer name or path if not the same as model_name",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="brushnet-model",
+        help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="The directory where the downloaded models and datasets will be stored.",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=512,
+        help=(
+            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
+            " resolution"
+        ),
+    )
+    parser.add_argument(
+        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
+    )
+    parser.add_argument("--num_train_epochs", type=int, default=10000)
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=None,
+        help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
+    )
+    parser.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=500,
+        help=(
+            "Save a checkpoint of the training state every X updates. Checkpoints can be used for resuming training via `--resume_from_checkpoint`. "
+            "In the case that the checkpoint is better than the final trained model, the checkpoint can also be used for inference."
+            "Using a checkpoint for inference requires separate loading of the original pipeline and the individual checkpointed model components."
+            "See https://huggingface.co/docs/diffusers/main/en/training/dreambooth#performing-inference-using-a-saved-checkpoint for step by step"
+            "instructions."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoints_total_limit",
+        type=int,
+        default=None,
+        help=("Max number of checkpoints to store."),
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
+            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
+        ),
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of updates steps to accumulate before performing a backward/update pass.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=5e-6,
+        help="Initial learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--scale_lr",
+        action="store_true",
+        default=False,
+        help="Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.",
+    )
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="constant",
+        help=(
+            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
+            ' "constant", "constant_with_warmup"]'
+        ),
+    )
+    parser.add_argument(
+        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+    )
+    parser.add_argument(
+        "--lr_num_cycles",
+        type=int,
+        default=1,
+        help="Number of hard resets of the lr in cosine_with_restarts scheduler.",
+    )
+    parser.add_argument("--lr_power", type=float, default=1.0, help="Power factor of the polynomial scheduler.")
+    parser.add_argument(
+        "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
+    )
+    parser.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
+        ),
+    )
+    parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
+    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
+    parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
+    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
+    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
+    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
+    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+    parser.add_argument(
+        "--hub_model_id",
+        type=str,
+        default=None,
+        help="The name of the repository to keep in sync with the local `output_dir`.",
+    )
+    parser.add_argument(
+        "--logging_dir",
+        type=str,
+        default="logs",
+        help=(
+            "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
+            " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
+        ),
+    )
+    parser.add_argument(
+        "--allow_tf32",
+        action="store_true",
+        help=(
+            "Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information, see"
+            " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
+        ),
+    )
+    parser.add_argument(
+        "--report_to",
+        type=str,
+        default="tensorboard",
+        help=(
+            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
+            ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
+        ),
+    )
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default=None,
+        choices=["no", "fp16", "bf16"],
+        help=(
+            "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
+            " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
+            " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
+        ),
+    )
+    parser.add_argument(
+        "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
+    )
+    parser.add_argument(
+        "--set_grads_to_none",
+        action="store_true",
+        help=(
+            "Save more memory by using setting grads to None instead of zero. Be aware, that this changes certain"
+            " behaviors, so disable this argument if it causes any problems. More info:"
+            " https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.zero_grad.html"
+        ),
+    )
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default=None,
+        help=(
+            "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
+            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
+            " or to a folder containing files that 🤗 Datasets can understand."
+        ),
+    )
+    parser.add_argument(
+        "--dataset_config_name",
+        type=str,
+        default=None,
+        help="The config of the Dataset, leave as None if there's only one config.",
+    )
+    parser.add_argument(
+        "--train_data_dir",
+        type=str,
+        default=None,
+        help=(
+            "A folder containing the training data. Folder contents must follow the structure described in"
+            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
+            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+        ),
+    )
+    parser.add_argument(
+        "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
+    )
+    parser.add_argument(
+        "--conditioning_image_column",
+        type=str,
+        default="conditioning_image",
+        help="The column of the dataset containing the brushnet conditioning image.",
+    )
+    parser.add_argument(
+        "--caption_column",
+        type=str,
+        default="text",
+        help="The column of the dataset containing a caption or a list of captions.",
+    )
+    parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=None,
+        help=(
+            "For debugging purposes or quicker training, truncate the number of training examples to this "
+            "value if set."
+        ),
+    )
+    parser.add_argument(
+        "--proportion_empty_prompts",
+        type=float,
+        default=0,
+        help="Proportion of image prompts to be replaced with empty strings. Defaults to 0 (no prompt replacement).",
+    )
+    parser.add_argument(
+        "--validation_prompt",
+        type=str,
+        default=[
+            "a black and red mountain bike parked on the side of a building",
+            "a cake with orange frosting and blueberries",
+            "a cat is sitting on a wooden chair",
+            "a kitten is playing with a flower",
+            "a german shepherd dog standing in a field",
+            "a plate of dumplings with chopsticks on top",
+            "two parrots sitting on a metal stand with food",
+            "a close up of a cherry blossom with white flowers",
+            "a boy walking his dog in the park",
+            "a painting of clouds in the sky",
+            "a painting of flowers in a blue and white vase",
+            "autumn road in the forest - stock photo",
+            "a vase with three flowers in it on a dark background",
+            "a bird with a black and white face sitting on a tree branch",
+            "a lighthouse in the middle of a stormy sea",
+            "a painting of a cup on top of books",
+            "a painting of a cabin in the snow with mountains in the background",
+            "a cat is shown in low polygonal style",
+            "a pug dog holding a red heart in its mouth",
+            "wolf howling at the moon digital art wolf howling at the moon by person",
+            "a jockey is riding a horse in a race",
+            "a plate with rice, peas and lemon wedges",
+            "a woman with her hair wrapped up in a towel",
+            "a cartoon girl sitting at a table with a pizza and a drink",
+        ],
+        nargs="+",
+        help=(
+            "A set of prompts evaluated every `--validation_steps` and logged to `--report_to`."
+            " Provide either a matching number of `--validation_image`s, a single `--validation_image`"
+            " to be used with all prompts, or a single prompt that will be used with all `--validation_image`s."
+        ),
+    )
+    parser.add_argument(
+        "--validation_image",
+        type=str,
+        default=[
+            "examples/brushnet/src/images/000000000_ori.jpg",
+            "examples/brushnet/src/images/000000001_ori.jpg",
+            "examples/brushnet/src/images/000000002_ori.jpg",
+            "examples/brushnet/src/images/000000003_ori.jpg",
+            "examples/brushnet/src/images/000000004_ori.jpg",
+            "examples/brushnet/src/images/000000005_ori.jpg",
+            "examples/brushnet/src/images/000000006_ori.jpg",
+            "examples/brushnet/src/images/000000007_ori.jpg",
+            "examples/brushnet/src/images/000000008_ori.jpg",
+            "examples/brushnet/src/images/000000009_ori.jpg",
+            "examples/brushnet/src/images/000000010_ori.jpg",
+            "examples/brushnet/src/images/000000011_ori.jpg",
+            "examples/brushnet/src/images/000000012_ori.jpg",
+            "examples/brushnet/src/images/000000013_ori.jpg",
+            "examples/brushnet/src/images/000000014_ori.jpg",
+            "examples/brushnet/src/images/000000015_ori.jpg",
+            "examples/brushnet/src/images/000000016_ori.jpg",
+            "examples/brushnet/src/images/000000017_ori.jpg",
+            "examples/brushnet/src/images/000000018_ori.jpg",
+            "examples/brushnet/src/images/000000019_ori.jpg",
+            "examples/brushnet/src/images/000000020_ori.jpg",
+            "examples/brushnet/src/images/000000021_ori.jpg",
+            "examples/brushnet/src/images/000000022_ori.jpg",
+            "examples/brushnet/src/images/000000023_ori.jpg",
+        ],
+        nargs="+",
+        help=(
+            "A set of paths to the paintingnet conditioning image be evaluated every `--validation_steps`"
+            " and logged to `--report_to`. Provide either a matching number of `--validation_prompt`s, a"
+            " a single `--validation_prompt` to be used with all `--validation_image`s, or a single"
+            " `--validation_image` that will be used with all `--validation_prompt`s."
+        ),
+    )
+    parser.add_argument(
+        "--validation_mask",
+        type=str,
+        default=[
+            "examples/brushnet/src/images/000000000_mask.jpg",
+            "examples/brushnet/src/images/000000001_mask.jpg",
+            "examples/brushnet/src/images/000000002_mask.jpg",
+            "examples/brushnet/src/images/000000003_mask.jpg",
+            "examples/brushnet/src/images/000000004_mask.jpg",
+            "examples/brushnet/src/images/000000005_mask.jpg",
+            "examples/brushnet/src/images/000000006_mask.jpg",
+            "examples/brushnet/src/images/000000007_mask.jpg",
+            "examples/brushnet/src/images/000000008_mask.jpg",
+            "examples/brushnet/src/images/000000009_mask.jpg",
+            "examples/brushnet/src/images/000000010_mask.jpg",
+            "examples/brushnet/src/images/000000011_mask.jpg",
+            "examples/brushnet/src/images/000000012_mask.jpg",
+            "examples/brushnet/src/images/000000013_mask.jpg",
+            "examples/brushnet/src/images/000000014_mask.jpg",
+            "examples/brushnet/src/images/000000015_mask.jpg",
+            "examples/brushnet/src/images/000000016_mask.jpg",
+            "examples/brushnet/src/images/000000017_mask.jpg",
+            "examples/brushnet/src/images/000000018_mask.jpg",
+            "examples/brushnet/src/images/000000019_mask.jpg",
+            "examples/brushnet/src/images/000000020_mask.jpg",
+            "examples/brushnet/src/images/000000021_mask.jpg",
+            "examples/brushnet/src/images/000000022_mask.jpg",
+            "examples/brushnet/src/images/000000023_mask.jpg",
+        ],
+        nargs="+",
+        help=(
+            "A set of paths to the paintingnet conditioning image be evaluated every `--validation_steps`"
+            " and logged to `--report_to`. Provide either a matching number of `--validation_prompt`s, a"
+            " a single `--validation_prompt` to be used with all `--validation_image`s, or a single"
+            " `--validation_image` that will be used with all `--validation_prompt`s."
+        ),
+    )
+    parser.add_argument(
+        "--num_validation_images",
+        type=int,
+        default=4,
+        help="Number of images to be generated for each `--validation_image`, `--validation_prompt` pair",
+    )
+    parser.add_argument(
+        "--validation_steps",
+        type=int,
+        default=100,
+        help=(
+            "Run validation every X steps. Validation consists of running the prompt"
+            " `args.validation_prompt` multiple times: `args.num_validation_images`"
+            " and logging the images."
+        ),
+    )
+    parser.add_argument(
+        "--tracker_project_name",
+        type=str,
+        default="train_brushnet",
+        help=(
+            "The `project_name` argument passed to Accelerator.init_trackers for"
+            " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
+        ),
+    )
+    parser.add_argument(
+        "--random_mask",
+        action="store_true",
+        help=(
+            "Training BrushNet with random mask"
+        ),
+    )
+    parser.add_argument(
+        "--enable_validation_metrics",
+        action="store_true",
+        help=(
+            "Calculate PSNR/LPIPS/MSE "
+            "during validation."
+        ),
+    )
+
+    parser.add_argument(
+        "--full_validation_metric_steps",
+        type=int,
+        default=5000,
+        help=(
+            "Calculate all 7 metrics every N "
+            "optimization steps. "
+            "0 means never during training."
+        ),
+    )
+
+    parser.add_argument(
+        "--validation_metric_ckpt_path",
+        type=str,
+        default="data/ckpt",
+    )
+
+    parser.add_argument(
+        "--validation_batch_size",
+        type=int,
+        default=4,
+        help="Batch size used for validation generation.",
+    )
+
+    add_wave_args(parser)
+    # Preserve original BrushNet training by default; freezing is optional.
+    parser.set_defaults(train_brushnet=True)
+    parser.add_argument('--freeze_brushnet', action='store_false', dest='train_brushnet')
+    parser.add_argument('--rms_init_batches', type=int, default=4)
+    parser.add_argument('--rms_mode', choices=['ema', 'fixed'], default='ema')
+    parser.add_argument('--rms_ema_decay', type=float, default=.99)
+    if input_args is not None:
+        args = parser.parse_args(input_args)
+    else:
+        args = parser.parse_args()
+
+    if args.dataset_name is None and args.train_data_dir is None:
+        raise ValueError("Specify either `--dataset_name` or `--train_data_dir`")
+
+    if args.dataset_name is not None and args.train_data_dir is not None:
+        raise ValueError("Specify only one of `--dataset_name` or `--train_data_dir`")
+
+    if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
+        raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
+
+    if args.validation_prompt is not None and args.validation_image is None:
+        raise ValueError("`--validation_image` must be set if `--validation_prompt` is set")
+
+    if args.validation_prompt is None and args.validation_image is not None:
+        raise ValueError("`--validation_prompt` must be set if `--validation_image` is set")
+
+    if (
+        args.validation_image is not None
+        and args.validation_prompt is not None
+        and len(args.validation_image) != 1
+        and len(args.validation_prompt) != 1
+        and len(args.validation_image) != len(args.validation_prompt)
+    ):
+        raise ValueError(
+            "Must provide either 1 `--validation_image`, 1 `--validation_prompt`,"
+            " or the same number of `--validation_prompt`s and `--validation_image`s"
+        )
+
+    if args.resolution % 8 != 0:
+        raise ValueError(
+            "`--resolution` must be divisible by 8 for consistently sized encoded images between the VAE and the brushnet encoder."
+        )
+
+    if args.resolution % 64 or args.rms_init_batches < 1:
+        raise ValueError('Wave resolution must be divisible by 64; rms_init_batches must be positive')
+    if args.wave_preset == 'B0' and not args.train_brushnet:
+        raise ValueError('B0 with frozen BrushNet has no trainable parameters')
+    if args.disable_validation:
+        args.validation_prompt = args.validation_image = args.validation_mask = None
+    return args
+
+
+class MyWebDataset():
+    def __init__(self,resolution,tokenizer,random_mask):
+        self.resolution = resolution
+        self.tokenizer = tokenizer
+        self.random_mask = random_mask
+
+    def random_brush_gen(
+        self,
+        max_tries,
+        h,
+        w,
+        min_num_vertex = 0,
+        max_num_vertex = 8,
+        mean_angle = 2*math.pi / 5,
+        angle_range = 2*math.pi / 15,
+        min_width = 128,
+        max_width = 128):
+        H, W = h, w
+        average_radius = math.sqrt(H*H+W*W) / 8
+        mask = Image.new('L', (W, H), 0)
+        for _ in range(np.random.randint(max_tries)):
+            num_vertex = np.random.randint(min_num_vertex, max_num_vertex)
+            angle_min = mean_angle - np.random.uniform(0, angle_range)
+            angle_max = mean_angle + np.random.uniform(0, angle_range)
+            angles = []
+            vertex = []
+            for i in range(num_vertex):
+                if i % 2 == 0:
+                    angles.append(2*math.pi - np.random.uniform(angle_min, angle_max))
+                else:
+                    angles.append(np.random.uniform(angle_min, angle_max))
+
+            h, w = mask.size
+            vertex.append((int(np.random.randint(0, w)), int(np.random.randint(0, h))))
+            for i in range(num_vertex):
+                r = np.clip(
+                    np.random.normal(loc=average_radius, scale=average_radius//2),
+                    0, 2*average_radius)
+                new_x = np.clip(vertex[-1][0] + r * math.cos(angles[i]), 0, w)
+                new_y = np.clip(vertex[-1][1] + r * math.sin(angles[i]), 0, h)
+                vertex.append((int(new_x), int(new_y)))
+
+            draw = ImageDraw.Draw(mask)
+            width = int(np.random.uniform(min_width, max_width))
+            draw.line(vertex, fill=1, width=width)
+            for v in vertex:
+                draw.ellipse((v[0] - width//2,
+                            v[1] - width//2,
+                            v[0] + width//2,
+                            v[1] + width//2),
+                            fill=1)
+            if np.random.random() > 0.5:
+                mask.transpose(Image.FLIP_LEFT_RIGHT)
+            if np.random.random() > 0.5:
+                mask.transpose(Image.FLIP_TOP_BOTTOM)
+        mask = np.asarray(mask, np.uint8)
+        if np.random.random() > 0.5:
+            mask = np.flip(mask, 0)
+        if np.random.random() > 0.5:
+            mask = np.flip(mask, 1)
+        return mask
+
+
+    def random_mask_gen(self, h, w):
+        mask = np.ones((h, w), np.uint8)
+        mask = np.logical_and(mask, 1 - self.random_brush_gen(4, h, w))  # hole denoted as 0, reserved as 1
+        return mask[np.newaxis, ...].astype(np.float32)
+
+
+    def rle2mask(self, mask_rle, shape):# height width
+        # Decode rle encoded mask.
+        mask_rle=np.array(mask_rle)
+        starts, lengths = [np.asarray(x, dtype=int) for x in (mask_rle[0:][::2], mask_rle[1:][::2])]
+        starts -= 1
+        ends = starts + lengths
+        img = np.zeros(shape[0] * shape[1], dtype=np.uint8)
+        for lo, hi in zip(starts, ends):
+            img[lo:hi] = 1
+        return img.reshape(shape, order='F')
+
+    def tokenize_captions(self, caption, is_train=True):
+        if random.random() < args.proportion_empty_prompts:
+            caption=""
+        elif isinstance(caption, str):
+            caption=caption
+        elif isinstance(caption, (list, np.ndarray)):
+            # take a random caption if there are multiple
+            caption=random.choice(caption) if is_train else caption[0]
+        else:
+            raise ValueError(
+                f"Caption column `{caption_column}` should contain either strings or lists of strings."
+            )
+        inputs = self.tokenizer(
+            caption, max_length=self.tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+        )
+        return inputs.input_ids
+
+    def __call__(self,examples):
+        pixel_values=[]
+        conditioning_pixel_values=[]
+        masks=[]
+        input_ids=[]
+        sample_keys = []
+        
+        for example in examples:
+            caption=example["caption"].decode('utf-8')
+            height=int(example["height"].decode('utf-8'))
+            width=int(example["width"].decode('utf-8'))
+            image = cv2.imdecode(np.asarray(bytearray(example["image"]), dtype="uint8"), cv2.IMREAD_COLOR)
+            segmentation = json.loads(example["segmentation"])
+
+
+            if len(segmentation["mask"])>0:
+                mask=self.rle2mask(random.choice(segmentation["mask"]),(height,width))[:,:,np.newaxis]
+            else:
+                mask=np.ones_like(image)[:,:,[0]]
+            
+            if self.random_mask:
+                mask = self.random_mask_gen(image.shape[0],image.shape[1])[0][:,:,np.newaxis]
+
+            
+            if random.random()<0.3:
+                kernel = np.ones((8,8),np.uint8)  
+                mask_erosion = cv2.erode(mask,kernel,iterations = 1)
+                mask_dilation = cv2.dilate(mask_erosion,kernel,iterations = 1)
+                mask=1*(mask_dilation>0)[:,:,np.newaxis]
+                mask=mask.astype(np.uint8)
+
+            masked_image=image*mask
+
+            if random.random()<0.5:
+                masked_image=image-masked_image
+                mask=1-mask
+            
+            w,h,c=image.shape
+            if w>h:
+                scale=self.resolution/h          
+            else:
+                scale=self.resolution/w
+            w_new=int(np.ceil(w*scale))
+            h_new=int(np.ceil(h*scale))
+            
+            image=cv2.resize(image,(h_new,w_new),interpolation=cv2.INTER_CUBIC)
+            masked_image=cv2.resize(masked_image,(h_new,w_new),interpolation=cv2.INTER_CUBIC)
+            mask=cv2.resize(mask,(h_new,w_new),interpolation=cv2.INTER_NEAREST)[:,:,np.newaxis]
+
+            random_crop=[random.randint(0,w_new-self.resolution),random.randint(0,h_new-self.resolution)]
+
+            image=image[random_crop[0]:random_crop[0]+self.resolution,random_crop[1]:random_crop[1]+self.resolution,:]
+            masked_image=masked_image[random_crop[0]:random_crop[0]+self.resolution,random_crop[1]:random_crop[1]+self.resolution,:]
+            mask=mask[random_crop[0]:random_crop[0]+self.resolution,random_crop[1]:random_crop[1]+self.resolution,:]
+            
+            masked_image = image * mask  # Align the final binary mask and conditioning image.
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            masked_image = cv2.cvtColor(masked_image, cv2.COLOR_BGR2RGB)
+            image = (image.astype(np.float32) / 127.5) - 1.0
+            masked_image = (masked_image.astype(np.float32) / 127.5) - 1.0
+
+            mask=mask.astype(np.float32)
+
+            pixel_values.append(torch.tensor(image).permute(2,0,1))
+            conditioning_pixel_values.append(torch.tensor(masked_image).permute(2,0,1))
+            masks.append(torch.tensor(mask).permute(2,0,1))
+            input_ids.append(self.tokenize_captions(caption)[0])
+
+        pixel_values = torch.stack(pixel_values)
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        conditioning_pixel_values = torch.stack(conditioning_pixel_values)
+        conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
+        masks = torch.stack(masks)
+        masks = masks.to(memory_format=torch.contiguous_format).float()
+        input_ids = torch.stack(input_ids)
+
+        tar_id = int(os.path.splitext(os.path.basename(example["__url__"]))[0])
+        sample_key = int(example["__key__"])
+        sample_keys.append([tar_id, sample_key])
+        return {
+            "pixel_values": pixel_values,
+            "conditioning_pixel_values": conditioning_pixel_values,
+            "masks":masks,
+            "input_ids": input_ids,
+            "sample_keys": torch.tensor(sample_keys, dtype=torch.long),
+        }
+
+
+# def make_train_dataset(args, tokenizer, accelerator):
+#     # Get the datasets: you can either provide your own training and evaluation files (see below)
+#     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
+
+#     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
+#     # download the dataset.
+#     if args.dataset_name is not None:
+#         # Downloading and loading a dataset from the hub.
+#         dataset = load_dataset(
+#             args.dataset_name,
+#             args.dataset_config_name,
+#             cache_dir=args.cache_dir,
+#         )
+#     else:
+#         if args.train_data_dir is not None:
+#             dataset = load_dataset(
+#                 args.train_data_dir,
+#                 cache_dir=args.cache_dir,
+#             )
+#         # See more about loading custom images at
+#         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
+
+#     # Preprocessing the datasets.
+#     # We need to tokenize inputs and targets.
+#     column_names = dataset["train"].column_names
+
+#     # 6. Get the column names for input/target.
+#     if args.image_column is None:
+#         image_column = column_names[0]
+#         logger.info(f"image column defaulting to {image_column}")
+#     else:
+#         image_column = args.image_column
+#         if image_column not in column_names:
+#             raise ValueError(
+#                 f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+#             )
+
+#     if args.caption_column is None:
+#         caption_column = column_names[1]
+#         logger.info(f"caption column defaulting to {caption_column}")
+#     else:
+#         caption_column = args.caption_column
+#         if caption_column not in column_names:
+#             raise ValueError(
+#                 f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+#             )
+
+#     if args.conditioning_image_column is None:
+#         conditioning_image_column = column_names[2]
+#         logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
+#     else:
+#         conditioning_image_column = args.conditioning_image_column
+#         if conditioning_image_column not in column_names:
+#             raise ValueError(
+#                 f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+#             )
+
+#     def tokenize_captions(examples, is_train=True):
+#         captions = []
+#         for caption in examples[caption_column]:
+#             if random.random() < args.proportion_empty_prompts:
+#                 captions.append("")
+#             elif isinstance(caption, str):
+#                 captions.append(caption)
+#             elif isinstance(caption, (list, np.ndarray)):
+#                 # take a random caption if there are multiple
+#                 captions.append(random.choice(caption) if is_train else caption[0])
+#             else:
+#                 raise ValueError(
+#                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
+#                 )
+#         inputs = tokenizer(
+#             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+#         )
+#         return inputs.input_ids
+
+#     image_transforms = transforms.Compose(
+#         [
+#             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+#             transforms.CenterCrop(args.resolution),
+#             transforms.ToTensor(),
+#             transforms.Normalize([0.5], [0.5]),
+#         ]
+#     )
+
+#     conditioning_image_transforms = transforms.Compose(
+#         [
+#             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+#             transforms.CenterCrop(args.resolution),
+#             transforms.ToTensor(),
+#         ]
+#     )
+
+#     def preprocess_train(examples):
+#         images = [image.convert("RGB") for image in examples[image_column]]
+#         images = [image_transforms(image) for image in images]
+
+#         conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
+#         conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
+
+#         examples["pixel_values"] = images
+#         examples["conditioning_pixel_values"] = conditioning_images
+#         examples["input_ids"] = tokenize_captions(examples)
+
+#         return examples
+
+#     with accelerator.main_process_first():
+#         if args.max_train_samples is not None:
+#             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+#         # Set the training transforms
+#         train_dataset = dataset["train"].with_transform(preprocess_train)
+
+#     return train_dataset
+
+
+# def collate_fn(examples):
+#     pixel_values = torch.stack([example["pixel_values"] for example in examples])
+#     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+#     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
+#     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
+
+#     masks = torch.stack([example["masks"] for example in examples])
+#     masks = masks.to(memory_format=torch.contiguous_format).float()
+
+#     input_ids = torch.stack([example["input_ids"] for example in examples])
+
+#     return {
+#         "pixel_values": pixel_values,
+#         "conditioning_pixel_values": conditioning_pixel_values,
+#         "masks":masks,
+#         "input_ids": input_ids,
+#     }
+
+
+def main(args):
+    if args.report_to == "wandb" and args.hub_token is not None:
+        raise ValueError(
+            "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
+            " Please use `huggingface-cli login` to authenticate with the Hub."
+        )
+
+    logging_dir = Path(args.output_dir, args.logging_dir)
+
+    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        log_with=args.report_to,
+        project_config=accelerator_project_config,
+    )
+
+    # Make one log on every process with the configuration for debugging.
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logger.info(accelerator.state, main_process_only=False)
+    if accelerator.is_local_main_process:
+        transformers.utils.logging.set_verbosity_warning()
+        diffusers.utils.logging.set_verbosity_info()
+    else:
+        transformers.utils.logging.set_verbosity_error()
+        diffusers.utils.logging.set_verbosity_error()
+
+    # If passed along, set the training seed now.
+    if args.seed is not None:
+        set_seed(args.seed)
+
+    # Handle the repository creation
+    if accelerator.is_main_process:
+        if args.output_dir is not None:
+            os.makedirs(args.output_dir, exist_ok=True)
+
+        if args.push_to_hub:
+            repo_id = create_repo(
+                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+            ).repo_id
+
+    # Load the tokenizer
+    if args.tokenizer_name:
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, revision=args.revision, use_fast=False)
+    elif args.pretrained_model_name_or_path:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="tokenizer",
+            revision=args.revision,
+            use_fast=False,
+        )
+
+    # import correct text encoder class
+    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
+
+    # Load scheduler and models
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    text_encoder = text_encoder_cls.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+    )
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+    )
+    unet = UNet2DConditionModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+    )
+
+    if args.brushnet_model_name_or_path:
+        logger.info("Loading existing brushnet weights")
+        brushnet = BrushNetModel.from_pretrained(args.brushnet_model_name_or_path)
+    else:
+        logger.info("Initializing brushnet weights from unet")
+        brushnet = BrushNetModel.from_unet(unet)
+
+    # Taken from [Sayak Paul's Diffusers PR #6511](https://github.com/huggingface/diffusers/pull/6511/files)
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
+
+    # Register both BrushNet and wave for the original Accelerator checkpoint flow.
+    register_model_hooks(accelerator)
+    wave = build_wave(brushnet, args, accelerator.device, noise_scheduler.config.num_train_timesteps)
+    brushnet.requires_grad_(args.train_brushnet)
+    rms_accumulator = RMSAccumulator(accelerator.device, args.rms_mode, args.rms_ema_decay)
+
+    vae.requires_grad_(False)
+    unet.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    brushnet.train(args.train_brushnet)
+
+    if args.enable_xformers_memory_efficient_attention:
+        if is_xformers_available():
+            import xformers
+
+            xformers_version = version.parse(xformers.__version__)
+            if xformers_version == version.parse("0.0.16"):
+                logger.warn(
+                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+                )
+            unet.enable_xformers_memory_efficient_attention()
+            brushnet.enable_xformers_memory_efficient_attention()
+        else:
+            raise ValueError("xformers is not available. Make sure it is installed correctly")
+
+    if args.gradient_checkpointing:
+        brushnet.enable_gradient_checkpointing()
+
+    # Check that all trainable models are in full precision
+    low_precision_error_string = (
+        " Please make sure to always have all model weights in full float32 precision when starting training - even if"
+        " doing mixed precision training, copy of the weights should still be float32."
+    )
+
+    if unwrap_model(brushnet).dtype != torch.float32:
+        raise ValueError(
+            f"BrushNet loaded as datatype {unwrap_model(brushnet).dtype}. {low_precision_error_string}"
+        )
+
+    # Enable TF32 for faster training on Ampere GPUs,
+    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+    if args.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    if args.scale_lr:
+        args.learning_rate = (
+            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+        )
+
+    # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
+    if args.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError(
+                "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
+            )
+
+        optimizer_class = bnb.optim.AdamW8bit
+    else:
+        optimizer_class = torch.optim.AdamW
+
+    # Optimizer creation
+    params_to_optimize = list(brushnet.parameters()) if args.train_brushnet else []
+    if wave is not None:
+        params_to_optimize += list(wave.parameters())
+    optimizer = optimizer_class(
+        params_to_optimize,
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+
+    # train_dataset = make_train_dataset(args, tokenizer, accelerator)
+
+    # train_dataloader = torch.utils.data.DataLoader(
+    #     train_dataset,
+    #     shuffle=True,
+    #     collate_fn=collate_fn,
+    #     batch_size=args.train_batch_size,
+    #     num_workers=args.dataloader_num_workers,
+    # )
+
+    # 固定 tar 顺序，只统计 .tar
+    SAMPLES_PER_TAR = 10000
+    tar_files = sorted(
+        os.path.join(args.train_data_dir, name)
+        for name in os.listdir(args.train_data_dir)
+        if name.endswith(".tar")
+    )
+
+    # tar_files = tar_files[540:]# 从500开始
+    train_dataset_len = SAMPLES_PER_TAR * len(tar_files)
+    train_dataset = load_dataset(
+        "webdataset",
+        data_files={"train": tar_files},
+        split="train",
+        streaming=True,
+    )
+    # train_dataset = load_dataset("webdataset",
+    #                 data_files={"train": os.path.join(args.train_data_dir,"*.tar")},
+    #                 split="train",
+    #                 streaming=True)
+    # train_dataset_len= 10000*len(os.listdir(args.train_data_dir))
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        shuffle=False,
+        collate_fn=MyWebDataset(resolution = args.resolution, tokenizer=tokenizer,random_mask=args.random_mask),
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+    )
+    train_dataloader_len=train_dataset_len//args.train_batch_size
+
+
+    # Scheduler and math around the number of training steps.
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(train_dataloader_len / args.gradient_accumulation_steps)
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
+
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        num_cycles=args.lr_num_cycles,
+        power=args.lr_power,
+    )
+
+    # Prepare everything with our `accelerator`.
+    train_models = ([brushnet] if args.train_brushnet else []) + ([wave] if wave is not None else [])
+    prepared = accelerator.prepare(*train_models, optimizer, train_dataloader, lr_scheduler)
+    train_models = list(prepared[:-3])
+    optimizer, train_dataloader, lr_scheduler = prepared[-3:]
+    if args.train_brushnet:
+        brushnet = train_models[0]
+    if wave is not None:
+        wave = train_models[-1]
+
+    # For mixed precision training we cast the text_encoder and vae weights to half-precision
+    # as these models are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    # Move vae, unet and text_encoder to device and cast to weight_dtype
+    vae.to(accelerator.device, dtype=weight_dtype)
+    unet.to(accelerator.device, dtype=weight_dtype)
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    if not args.train_brushnet:
+        brushnet.to(accelerator.device, dtype=weight_dtype)
+
+    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    num_update_steps_per_epoch = math.ceil(train_dataloader_len / accelerator.num_processes / args.gradient_accumulation_steps)
+    if overrode_max_train_steps:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    # Afterwards we recalculate our number of training epochs
+    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    # We need to initialize the trackers we use, and also store our configuration.
+    # The trackers initializes automatically on the main process.
+    if accelerator.is_main_process:
+        tracker_config = dict(vars(args))
+
+        # tensorboard cannot handle list types for config
+        tracker_config.pop("validation_prompt")
+        tracker_config.pop("validation_image")
+        tracker_config.pop("validation_mask")
+        tracker_config.pop("random_mask")
+
+        tracker_config = {k: json.dumps(v) if isinstance(v, (list, dict)) else v for k, v in tracker_config.items()}
+        accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
+
+    validation_evaluator = None
+    if (accelerator.is_main_process and args.enable_validation_metrics):
+        validation_evaluator = (
+            BrushNetValidationEvaluator(
+                device=accelerator.device,
+                ckpt_path=args.validation_metric_ckpt_path,
+                offload=True,
+            )
+        )
+        logger.info("Validation evaluator initialized.")
+    # Train!
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {train_dataset_len}")
+    logger.info(f"  Num batches each epoch = {train_dataloader_len}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    global_step = 0
+    first_epoch = 0
+    resume_dataloader = None
+
+    # Potentially load in the weights and states from a previous save
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint != "latest":
+            path = os.path.basename(args.resume_from_checkpoint)
+        else:
+            # Get the most recent checkpoint
+            dirs = os.listdir(args.output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1] if len(dirs) > 0 else None
+
+        if path is None:
+            accelerator.print(
+                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
+            )
+            args.resume_from_checkpoint = None
+            initial_global_step = 0
+        else:
+            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.load_state(os.path.join(args.output_dir, path),map_location="cpu")
+            global_step = int(path.split("-")[1])
+
+            initial_global_step = global_step
+            first_epoch = global_step // num_update_steps_per_epoch
+
+            # 计算 checkpoint 在当前 epoch 中已经消费的全局图片数
+            steps_in_epoch = global_step % num_update_steps_per_epoch
+            samples_in_epoch = steps_in_epoch * total_batch_size
+
+            # 直接定位到对应 tar，只需在当前 tar 内最多跳过 9999 张
+            resume_tar_index, resume_sample_offset = divmod(
+                samples_in_epoch,
+                SAMPLES_PER_TAR,
+            )
+
+            logger.info(
+                f"Resume data position: epoch={first_epoch}, "
+                f"samples={samples_in_epoch}, "
+                f"tar={resume_tar_index}, offset={resume_sample_offset}",
+                main_process_only=True,
+            )
+
+            resume_tar_files = tar_files[resume_tar_index:]
+
+            if len(resume_tar_files) == 0:
+                raise RuntimeError(
+                    f"Resume tar index {resume_tar_index} exceeds tar count {len(tar_files)}"
+                )
+
+            logger.info(
+                f"Resume from {os.path.basename(resume_tar_files[0])}, "
+                f"sample offset={resume_sample_offset}",
+                main_process_only=True,
+            )
+
+            resume_dataset = load_dataset(
+                "webdataset",
+                data_files={"train": resume_tar_files},
+                split="train",
+                streaming=True,
+            )
+
+            # 如果 checkpoint 不刚好落在 tar 边界，只跳当前 tar 内剩余部分
+            # 这里不跳了 跳了可能会有多线程问题。 只跳包就行了
+            # if resume_sample_offset > 0:
+            #     resume_dataset = resume_dataset.skip(resume_sample_offset)
+
+            resume_dataloader = torch.utils.data.DataLoader(
+                resume_dataset,
+                shuffle=False,
+                collate_fn=MyWebDataset(
+                    resolution=args.resolution,
+                    tokenizer=tokenizer,
+                    random_mask=args.random_mask,
+                ),
+                batch_size=args.train_batch_size,
+                num_workers=args.dataloader_num_workers,
+            )
+
+            resume_dataloader = accelerator.prepare(resume_dataloader)
+    else:
+        initial_global_step = 0
+
+    # Short extra pass over the ORIGINAL streaming loader. Loaded RMS is never overwritten.
+    initialize_rms_from_loader(
+        wave, resume_dataloader if resume_dataloader is not None else train_dataloader,
+        accelerator, args.rms_init_batches,
+    )
+
+    progress_bar = tqdm(
+        range(0, args.max_train_steps),
+        initial=initial_global_step,
+        desc="Steps",
+        # Only show the progress bar once on each machine.
+        disable=not accelerator.is_local_main_process,
+    )
+
+    image_logs = None
+    for epoch in range(first_epoch, args.num_train_epochs):
+        # Resume 的第一个 epoch 使用定位后的 tar，之后恢复完整数据集
+        if epoch == first_epoch and resume_dataloader is not None:
+            active_dataloader = resume_dataloader
+        else:
+            active_dataloader = train_dataloader
+
+        for step, batch in enumerate(active_dataloader):
+            # 测试跳过的结果
+            if accelerator.is_main_process and epoch == first_epoch and step == 0:
+                keys = batch["sample_keys"].detach().cpu().tolist()
+                keys = [f"{tar_id:05d}.tar:{key:09d}" for tar_id, key in keys]
+                logger.info(f"[RESUME CHECK] step={global_step + 1}, keys={keys}")
+            with accelerator.accumulate(*train_models):
+                # Convert images to latent space
+                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
+
+                conditioning_latents=vae.encode(batch["conditioning_pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+                conditioning_latents = conditioning_latents * vae.config.scaling_factor
+
+                masks = torch.nn.functional.interpolate(
+                    batch["masks"], 
+                    size=(
+                        latents.shape[-2], 
+                        latents.shape[-1]
+                    )
+                )
+
+                conditioning_latents=torch.concat([conditioning_latents,masks.to(dtype=weight_dtype)],1)
+
+                # Sample noise that we'll add to the latents
+                noise = torch.randn_like(latents)
+                bsz = latents.shape[0]
+                # Sample a random timestep for each image
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = timesteps.long()
+
+                # Add noise to the latents according to the noise magnitude at each timestep
+                # (this is the forward diffusion process)
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                # Get the text embedding for conditioning
+                encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
+
+                down_block_res_samples, mid_block_res_sample, up_block_res_samples = brushnet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=encoder_hidden_states,
+                    brushnet_cond=conditioning_latents,
+                    return_dict=False,
+                )
+
+                if wave is not None:
+                    extra = wave(batch['conditioning_pixel_values'], 1-batch['masks'], timesteps)
+                    down_block_res_samples, mid_block_res_sample, up_block_res_samples = merge_residuals(
+                        (down_block_res_samples, mid_block_res_sample, up_block_res_samples), extra)
+                    rms_accumulator.add(batch['pixel_values'])
+
+                # Predict the noise residual
+                model_pred = unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=encoder_hidden_states,
+                    down_block_add_samples=[
+                        sample.to(dtype=weight_dtype) for sample in down_block_res_samples
+                    ],
+                    mid_block_add_sample=mid_block_res_sample.to(dtype=weight_dtype),
+                    up_block_add_samples=[
+                        sample.to(dtype=weight_dtype) for sample in up_block_res_samples
+                    ],
+                    return_dict=False,
+                )[0]
+
+                # Get the target for loss depending on the prediction type
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = params_to_optimize
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                optimizer.step()
+                # Keep the original prepared scheduler and its stepping convention.
+                lr_scheduler.step()
+                if accelerator.sync_gradients and wave is not None:
+                    rms_accumulator.finish(unwrap_model(wave), not accelerator.optimizer_step_was_skipped)
+                optimizer.zero_grad(set_to_none=args.set_grads_to_none)
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+
+                if accelerator.is_main_process:
+                    if global_step % args.checkpointing_steps == 0:
+                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                        if args.checkpoints_total_limit is not None:
+                            checkpoints = os.listdir(args.output_dir)
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                            if len(checkpoints) >= args.checkpoints_total_limit:
+                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                removing_checkpoints = checkpoints[0:num_to_remove]
+
+                                logger.info(
+                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                )
+                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                                for removing_checkpoint in removing_checkpoints:
+                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                    shutil.rmtree(removing_checkpoint)
+
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+
+                if global_step % args.checkpointing_steps == 0:
+                    accelerator.wait_for_everyone()
+                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    accelerator.save_state(save_path)
+                    accelerator.wait_for_everyone()
+                    logger.info(f"Saved state to {save_path}")
+
+                if args.validation_prompt is not None and global_step % args.validation_steps == 0:
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        image_logs = log_validation_evaluator(
+                            vae,
+                            text_encoder,
+                            tokenizer,
+                            unet,
+                            brushnet,
+                            args,
+                            accelerator,
+                            weight_dtype,
+                            global_step,
+                            validation_evaluator=validation_evaluator,
+                            wave=wave,
+                        )
+                    accelerator.wait_for_everyone()
+
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs, refresh=False) #不能刷新不然可能会出很多条
+            accelerator.log(logs, step=global_step)
+
+            if global_step >= args.max_train_steps:
+                break
+
+    # Create the pipeline using using the trained modules and save it.
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        brushnet = unwrap_model(brushnet)
+        brushnet.save_pretrained(args.output_dir)
+        if wave is not None:
+            unwrap_model(wave).save_pretrained(Path(args.output_dir) / 'wave')
+
+        # Run a final round of validation.
+        image_logs = None
+        if args.validation_prompt is not None:
+            image_logs = log_validation_evaluator(
+                vae=vae,
+                text_encoder=text_encoder,
+                tokenizer=tokenizer,
+                unet=unet,
+                brushnet=None,
+                args=args,
+                accelerator=accelerator,
+                weight_dtype=weight_dtype,
+                step=global_step,
+                validation_evaluator=validation_evaluator,
+                is_final_validation=True,
+                wave=wave,
+            )
+
+        if args.push_to_hub:
+            save_model_card(
+                repo_id,
+                image_logs=image_logs,
+                base_model=args.pretrained_model_name_or_path,
+                repo_folder=args.output_dir,
+            )
+            upload_folder(
+                repo_id=repo_id,
+                folder_path=args.output_dir,
+                commit_message="End of training",
+                ignore_patterns=["step_*", "epoch_*"],
+            )
+
+    if (
+            accelerator.is_main_process
+            and
+            validation_evaluator
+            is not None
+    ):
+        validation_evaluator.close()
+
+    validation_evaluator = None
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    accelerator.wait_for_everyone()
+    accelerator.end_training()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args)

@@ -14,6 +14,7 @@ def add_wave_args(parser):
     parser.add_argument('--wave_rms', type=str)
     parser.add_argument('--wave_resume', type=str, help='Warm-start wave folder; not optimizer resume')
     parser.add_argument('--wave_widths', type=int, nargs=4, default=[32,64,96,128])
+    parser.add_argument('--wave_adapter', choices=['legacy','unet','selfattn','hybrid','crossattn'], default='legacy')
     parser.add_argument('--wave_gate', choices=['fixed','constant','time'])
     parser.add_argument('--wave_gate_max', type=float, default=2.)
     parser.add_argument('--wave_gate_init', type=float, default=1.)
@@ -60,7 +61,8 @@ def build_wave(brushnet, args, device, timesteps=1000):
         options['reliability'] = args.wave_reliability
     wave = WaveConditioner(spec,**options,widths=args.wave_widths,support=args.wave_support,
                            gate_max=args.wave_gate_max,gate_init=args.wave_gate_init,timesteps=timesteps,
-                           soft_lambda=args.wave_soft_lambda,shared=args.wave_shared,coarse_only=args.wave_coarse_only).to(device)
+                           soft_lambda=args.wave_soft_lambda,shared=args.wave_shared,coarse_only=args.wave_coarse_only,
+                           adapter_type=args.wave_adapter,cross_attention_dim=cross_dim,cross_attention_heads=8).to(device)
     if options['transform'] != 'rgb' and args.wave_rms:
         data = json.loads(Path(args.wave_rms).read_text())
         if data.get('resolution') != args.resolution:
@@ -103,8 +105,12 @@ def wave_inference(brushnet,wave,images,masks,trace=None):
     if len(images) != len(masks):
         raise ValueError('Image/mask batch differs')
     x,m=image_tensors(images,masks,device)
-    with torch.no_grad():
-        features=wave.encode(x,m)
+    crossattn = wave.config.get('adapter_type') == 'crossattn'
+    features = None
+    if not crossattn:
+        with torch.no_grad():
+            features=wave.encode(x,m)
+    cross_cache = {}
     batch=len(images)
     calls=[0]
 
@@ -116,7 +122,18 @@ def wave_inference(brushnet,wave,images,masks,trace=None):
         n=sample.shape[0]
         if n not in (batch,2*batch):
             raise ValueError('Only num_images_per_prompt=1 and ordinary CFG are supported')
-        cached=features if n==batch else [[f.repeat(2,1,1,1) for f in branch] for branch in features]
+        if crossattn:
+            encoder_hidden_states = kwargs.get('encoder_hidden_states')
+            if encoder_hidden_states is None:
+                raise ValueError('crossattn wave adapter requires BrushNet encoder_hidden_states')
+            if n not in cross_cache:
+                xi = x if n == batch else x.repeat(2,1,1,1)
+                mi = m if n == batch else m.repeat(2,1,1,1)
+                with torch.no_grad():
+                    cross_cache[n] = wave.encode(xi,mi,encoder_hidden_states)
+            cached = cross_cache[n]
+        else:
+            cached=features if n==batch else [[f.repeat(2,1,1,1) for f in branch] for branch in features]
         with torch.no_grad():
             extra=wave.project(cached,t)
         if trace is not None:
