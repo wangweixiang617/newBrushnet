@@ -45,3 +45,7 @@ data/
 img/
 datasets/
 *.xlsx
+
+*.diff
+diffs/
+diffs1/
