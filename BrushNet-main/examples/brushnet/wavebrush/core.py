@@ -98,7 +98,7 @@ def merge_residuals(base, additions, strength=1.):
         if x.shape != y.shape:
             raise ValueError(f'Residual shape mismatch: {x.shape} vs {y.shape}')
         out.append(x + strength*y.to(x.dtype))
-    return tuple(out[:nd]), out[nd], tuple(out[nd+1:])
+    return list(out[:nd]), out[nd], list(out[nd+1:])
 
 
 class Adapter(nn.Module):

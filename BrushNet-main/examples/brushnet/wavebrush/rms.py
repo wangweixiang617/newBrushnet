@@ -111,7 +111,16 @@ def initialize_rms_from_loader(wave, dataloader, accelerator, num_batches=4):
         # An early break in an Accelerate iterator may not execute its normal end().
         state = getattr(dataloader, 'gradient_state', None)
         if state is not None and state.active_dataloader is dataloader:
-            dataloader.end()
+            # dataloader.end()
+            end = getattr(dataloader, 'end', None)
+            if callable(end):
+                # 新版 Accelerate
+                end()
+            else:
+                # 旧版 Accelerate
+                remove = getattr(state, '_remove_dataloader', None)
+                if callable(remove):
+                    remove(dataloader)
         if iteration is not None:
             dataloader.set_epoch(iteration)
         for g, state in generators.values():

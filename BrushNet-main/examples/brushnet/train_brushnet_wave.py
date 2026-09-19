@@ -2,6 +2,7 @@
 # coding=utf-8
 
 import argparse
+import contextlib
 import gc
 import logging
 import math
@@ -132,7 +133,7 @@ def log_validation_evaluator(
     # 最多只取前 VALIDATIONCOUNTMAX 个
     validation_items = list(zip(validation_prompts, validation_images, validation_masks))[:VALIDATIONCOUNTMAX]
     image_logs, metric_samples = [], []
-    inference_ctx = accelerator.autocast()
+    # inference_ctx = accelerator.autocast()
     validation_batch_size = max(1, getattr(args, "validation_batch_size", 4))
 
     # 先把 validation 样本都准备好
@@ -171,6 +172,7 @@ def log_validation_evaluator(
         leave=False,
     )
 
+    trace_saved = False
     # 按 repeat 生成，这样仍保留每个样本 num_validation_images 张输出的语义
     for repeat_idx in range(args.num_validation_images):
         for batch_idx, batch_start in enumerate(range(0, len(prepared_samples), validation_batch_size)):
@@ -179,8 +181,11 @@ def log_validation_evaluator(
             batch_conditioning_images = [sample["conditioning_image"] for sample in batch_samples]
             batch_mask_images = [sample["mask_image"] for sample in batch_samples]
 
-            with torch.no_grad(), inference_ctx, wave_inference(
-                brushnet, wave, batch_conditioning_images, batch_mask_images
+            # 只给第一个 batch 创建 trace list
+            # 后续 batch 直接传 None
+            batch_trace = [] if (not trace_saved and wave is not None) else None
+            with torch.no_grad(), accelerator.autocast(), wave_inference(
+                brushnet, wave, batch_conditioning_images, batch_mask_images, trace= batch_trace
             ):
                 batch_result = pipeline(
                     batch_prompts,
@@ -189,6 +194,15 @@ def log_validation_evaluator(
                     num_inference_steps=50,
                     generator=generator,
                 )
+
+            if batch_trace is not None:
+                validation_dir = Path(args.output_dir) / "validation"
+                validation_dir.mkdir(parents=True, exist_ok=True)
+                trace_prefix = "final"if is_final_validation else "train"
+                trace_path = validation_dir / f"{trace_prefix}_wave_validation_trace_{step:06d}.json"
+                trace_path.write_text(json.dumps(batch_trace, indent=2, ensure_ascii=False),encoding = "utf-8")
+                trace_saved = True
+
 
             for i, generated_image in enumerate(batch_result.images):
                 sample = batch_samples[i]
@@ -313,115 +327,6 @@ def log_validation_evaluator(
         torch.cuda.empty_cache()
 
     return image_logs
-@validation_guard
-def log_validation(
-    vae, text_encoder, tokenizer, unet, brushnet, args, accelerator, weight_dtype, step, is_final_validation=False, wave=None
-):
-    logger.info("Running validation... ")
-
-    if not is_final_validation:
-        brushnet = accelerator.unwrap_model(brushnet)
-    else:
-        brushnet = BrushNetModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
-
-    pipeline = StableDiffusionBrushNetPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        unet=unet,
-        brushnet=brushnet,
-        safety_checker=None,
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=weight_dtype,
-    )
-    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
-
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-
-    if len(args.validation_image) == len(args.validation_prompt) and len(args.validation_image) == len(args.validation_mask):
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt
-        validation_masks = args.validation_mask
-    else:
-        raise ValueError(
-            "number of `args.validation_image`, `args.validation_mask`, and `args.validation_prompt` should be checked in `parse_args`"
-        )
-
-    image_logs = []
-    inference_ctx = accelerator.autocast()
-
-    for validation_prompt, validation_image, validation_mask in zip(validation_prompts, validation_images, validation_masks):
-        validation_image = Image.open(validation_image).convert("RGB")
-        validation_mask = Image.open(validation_mask).convert("RGB")
-        validation_image = Image.composite(Image.new('RGB', (validation_image.size[0], validation_image.size[1]), (0, 0, 0)), validation_image, validation_mask.convert("L"))
-
-        images = []
-
-        for _ in range(args.num_validation_images):
-            with torch.no_grad(), inference_ctx, wave_inference(
-                brushnet, wave, [validation_image], [validation_mask]
-            ):
-                image = pipeline(
-                    validation_prompt, validation_image, validation_mask, num_inference_steps=20, generator=generator
-                ).images[0]
-
-            images.append(image)
-
-        image_logs.append(
-            {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt}
-        )
-
-    tracker_key = "test" if is_final_validation else "validation"
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
-
-                formatted_images = []
-
-                formatted_images.append(np.asarray(validation_image))
-
-                for image in images:
-                    formatted_images.append(np.asarray(image))
-
-                formatted_images = np.stack(formatted_images)
-
-                tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
-        elif tracker.name == "wandb":
-            formatted_images = []
-
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
-
-                formatted_images.append(wandb.Image(validation_image, caption="BrushNet conditioning"))
-
-                for image in images:
-                    image = wandb.Image(image, caption=validation_prompt)
-                    formatted_images.append(image)
-
-            tracker.log({tracker_key: formatted_images})
-        else:
-            logger.warn(f"image logging not implemented for {tracker.name}")
-
-        del pipeline
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        return image_logs
 
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
@@ -1166,140 +1071,22 @@ class MyWebDataset():
             "sample_keys": torch.tensor(sample_keys, dtype=torch.long),
         }
 
+@contextlib.contextmanager
+def accumulate_models(accelerator, models):
+    if len(models) == 0:
+        yield
+        return
 
-# def make_train_dataset(args, tokenizer, accelerator):
-#     # Get the datasets: you can either provide your own training and evaluation files (see below)
-#     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
+    with accelerator.accumulate(models[0]):
+        with contextlib.ExitStack() as stack:
 
-#     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-#     # download the dataset.
-#     if args.dataset_name is not None:
-#         # Downloading and loading a dataset from the hub.
-#         dataset = load_dataset(
-#             args.dataset_name,
-#             args.dataset_config_name,
-#             cache_dir=args.cache_dir,
-#         )
-#     else:
-#         if args.train_data_dir is not None:
-#             dataset = load_dataset(
-#                 args.train_data_dir,
-#                 cache_dir=args.cache_dir,
-#             )
-#         # See more about loading custom images at
-#         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
+            if not accelerator.sync_gradients:
+                for model in models[1:]:
+                    no_sync = getattr(model, "no_sync", None)
+                    if callable(no_sync):
+                        stack.enter_context(no_sync())
 
-#     # Preprocessing the datasets.
-#     # We need to tokenize inputs and targets.
-#     column_names = dataset["train"].column_names
-
-#     # 6. Get the column names for input/target.
-#     if args.image_column is None:
-#         image_column = column_names[0]
-#         logger.info(f"image column defaulting to {image_column}")
-#     else:
-#         image_column = args.image_column
-#         if image_column not in column_names:
-#             raise ValueError(
-#                 f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-#             )
-
-#     if args.caption_column is None:
-#         caption_column = column_names[1]
-#         logger.info(f"caption column defaulting to {caption_column}")
-#     else:
-#         caption_column = args.caption_column
-#         if caption_column not in column_names:
-#             raise ValueError(
-#                 f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-#             )
-
-#     if args.conditioning_image_column is None:
-#         conditioning_image_column = column_names[2]
-#         logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
-#     else:
-#         conditioning_image_column = args.conditioning_image_column
-#         if conditioning_image_column not in column_names:
-#             raise ValueError(
-#                 f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-#             )
-
-#     def tokenize_captions(examples, is_train=True):
-#         captions = []
-#         for caption in examples[caption_column]:
-#             if random.random() < args.proportion_empty_prompts:
-#                 captions.append("")
-#             elif isinstance(caption, str):
-#                 captions.append(caption)
-#             elif isinstance(caption, (list, np.ndarray)):
-#                 # take a random caption if there are multiple
-#                 captions.append(random.choice(caption) if is_train else caption[0])
-#             else:
-#                 raise ValueError(
-#                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
-#                 )
-#         inputs = tokenizer(
-#             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-#         )
-#         return inputs.input_ids
-
-#     image_transforms = transforms.Compose(
-#         [
-#             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-#             transforms.CenterCrop(args.resolution),
-#             transforms.ToTensor(),
-#             transforms.Normalize([0.5], [0.5]),
-#         ]
-#     )
-
-#     conditioning_image_transforms = transforms.Compose(
-#         [
-#             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-#             transforms.CenterCrop(args.resolution),
-#             transforms.ToTensor(),
-#         ]
-#     )
-
-#     def preprocess_train(examples):
-#         images = [image.convert("RGB") for image in examples[image_column]]
-#         images = [image_transforms(image) for image in images]
-
-#         conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
-#         conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
-
-#         examples["pixel_values"] = images
-#         examples["conditioning_pixel_values"] = conditioning_images
-#         examples["input_ids"] = tokenize_captions(examples)
-
-#         return examples
-
-#     with accelerator.main_process_first():
-#         if args.max_train_samples is not None:
-#             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-#         # Set the training transforms
-#         train_dataset = dataset["train"].with_transform(preprocess_train)
-
-#     return train_dataset
-
-
-# def collate_fn(examples):
-#     pixel_values = torch.stack([example["pixel_values"] for example in examples])
-#     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-#     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
-#     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
-
-#     masks = torch.stack([example["masks"] for example in examples])
-#     masks = masks.to(memory_format=torch.contiguous_format).float()
-
-#     input_ids = torch.stack([example["input_ids"] for example in examples])
-
-#     return {
-#         "pixel_values": pixel_values,
-#         "conditioning_pixel_values": conditioning_pixel_values,
-#         "masks":masks,
-#         "input_ids": input_ids,
-#     }
+            yield
 
 
 def main(args):
@@ -1713,7 +1500,14 @@ def main(args):
                 keys = batch["sample_keys"].detach().cpu().tolist()
                 keys = [f"{tar_id:05d}.tar:{key:09d}" for tar_id, key in keys]
                 logger.info(f"[RESUME CHECK] step={global_step + 1}, keys={keys}")
-            with accelerator.accumulate(*train_models):
+
+                print("brushnet type:", type(brushnet))
+                print("wave type:", type(wave))
+                print("brushnet has no_sync:", hasattr(brushnet, "no_sync"))
+                print("wave has no_sync:", hasattr(wave, "no_sync"))
+
+            # with accelerator.accumulate(*train_models): #这个模式现在的版本不支持
+            with accumulate_models(accelerator, train_models):
                 # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
@@ -1784,6 +1578,22 @@ def main(args):
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)
+
+                #gate的梯度检查
+                # raw_wave = accelerator.unwrap_model(wave)
+                # if accelerator.is_main_process:
+                #     print("gate mode:", raw_wave.gates.mode)
+                #     for name, p in raw_wave.gates.named_parameters():
+                #         grad_mean = None
+                #         if p.grad is not None:
+                #             grad_mean = p.grad.detach().float().abs().mean().item()
+                #         print(
+                #             name,
+                #             "mean =", p.detach().float().mean().item(),
+                #             "absmax =", p.detach().float().abs().max().item(),
+                #             "grad_mean =", grad_mean,
+                #         )
+
                 if accelerator.sync_gradients:
                     params_to_clip = params_to_optimize
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)

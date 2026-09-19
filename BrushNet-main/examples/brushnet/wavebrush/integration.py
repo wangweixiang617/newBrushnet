@@ -10,11 +10,11 @@ from .core import WaveConditioner, PRESETS, slot_spec, flatten_residuals, merge_
 
 
 def add_wave_args(parser):
-    parser.add_argument('--wave_preset', choices=['B0']+list(PRESETS), default='B7_time')
-    parser.add_argument('--wave_rms', type=str)
+    parser.add_argument('--wave_preset', choices=['B0']+list(PRESETS), default='recommended')
+    parser.add_argument('--wave_rms', type=str)  #rms的路径
     parser.add_argument('--wave_resume', type=str, help='Warm-start wave folder; not optimizer resume')
     parser.add_argument('--wave_widths', type=int, nargs=4, default=[32,64,96,128])
-    parser.add_argument('--wave_adapter', choices=['legacy','unet','selfattn','hybrid','crossattn'], default='legacy')
+    parser.add_argument('--wave_adapter', choices=['legacy','unet','selfattn','hybrid','crossattn'], default='unet')
     parser.add_argument('--wave_gate', choices=['fixed','constant','time'])
     parser.add_argument('--wave_gate_max', type=float, default=2.)
     parser.add_argument('--wave_gate_init', type=float, default=1.)
@@ -25,7 +25,7 @@ def add_wave_args(parser):
     parser.add_argument('--wave_soft_lambda', type=float, default=.5)
     parser.add_argument('--train_brushnet', action='store_true', help='Joint fine-tuning (default in the minimal training entrypoint)')
     parser.add_argument('--disable_validation', action='store_true')
-    parser.add_argument('--wave_log_every', type=int, default=100)
+    parser.add_argument('--wave_log_every', type=int, default=10)
 
 
 @torch.no_grad()
@@ -138,7 +138,11 @@ def wave_inference(brushnet,wave,images,masks,trace=None):
             extra=wave.project(cached,t)
         if trace is not None:
             base,_,_=flatten_residuals(result)
-            gates=wave.effective_gates(torch.as_tensor(t,device=device).reshape(-1)).detach().float().cpu().tolist()
+            #换个精度试试 临时关闭bf16
+            with torch.autocast(device_type=device.type,enabled=False):
+                gate_tensor=wave.effective_gates(torch.as_tensor(t,device=device).reshape(-1)).detach().float().cpu()
+            gates = gate_tensor.numpy().round(8).tolist()
+            # gates=wave.effective_gates(torch.as_tensor(t,device=device).reshape(-1)).detach().float().cpu().tolist()
             trace.append(dict(call=calls[0],t=float(torch.as_tensor(t).flatten()[0]),gates=gates,
                               residuals=residual_stats(base,extra),branch_rms=wave.branch_rms(cached,t)))
         calls[0]+=1
