@@ -45,7 +45,7 @@ class BrushNetValidationEvaluator:
         self.offload = offload
 
         # Light metric：LPIPS 使用 BrushNet 官方一致的 SqueezeNet，初始化在 CPU。
-        self.lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type="squeeze").eval()
+        self.lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type="squeeze", sync_on_compute=False, dist_sync_on_step=False).eval()
 
         # Heavy metrics：全部 lazy load，第一次 full=True 时才加载。
         self.clip_metric = None
@@ -169,7 +169,7 @@ class BrushNetValidationEvaluator:
         """CLIPScore lazy load；第一次 full=True 时创建，默认留在 CPU。"""
         if self.clip_metric is None:
             print("[Evaluator] Loading CLIPScore...")
-            self.clip_metric = CLIPScore(model_name_or_path=self.clip_score_model_path).eval()
+            self.clip_metric = CLIPScore(model_name_or_path=self.clip_score_model_path, sync_on_compute=False, dist_sync_on_step=False).eval()
 
     def _calculate_clip_batch(self, samples):
         """CLIP 生命周期：CPU -> GPU -> 计算所有 samples -> CPU。"""

@@ -1643,8 +1643,9 @@ def main(args):
             )
 
             # 如果 checkpoint 不刚好落在 tar 边界，只跳当前 tar 内剩余部分
-            if resume_sample_offset > 0:
-                resume_dataset = resume_dataset.skip(resume_sample_offset)
+            # 这里不跳了 跳了可能会有多线程问题。 只跳包就行了
+            # if resume_sample_offset > 0:
+            #     resume_dataset = resume_dataset.skip(resume_sample_offset)
 
             resume_dataloader = torch.utils.data.DataLoader(
                 resume_dataset,
