@@ -1696,8 +1696,8 @@ def main(args):
                     accelerator.wait_for_everyone()
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     accelerator.save_state(save_path)
-                    if accelerator.is_main_process and not args.train_brushnet:
-                        unwrap_model(brushnet).save_pretrained(Path(save_path) / 'brushnet')
+                    # if accelerator.is_main_process and not args.train_brushnet:
+                    #     unwrap_model(brushnet).save_pretrained(Path(save_path) / 'brushnet')
                     accelerator.wait_for_everyone()
                     logger.info(f"Saved state to {save_path}")
 

@@ -6,7 +6,10 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
-from .core import WaveConditioner, PRESETS, slot_spec, flatten_residuals, merge_residuals
+from .core import (
+    WaveConditioner, PRESETS, slot_spec, flatten_residuals, merge_residuals,
+    haar_pyramid, BANDS,
+)
 
 
 def add_wave_args(parser):
@@ -25,6 +28,11 @@ def add_wave_args(parser):
     parser.add_argument('--wave_soft_lambda', type=float, default=.5)
     parser.add_argument('--train_brushnet', action='store_true', help='Joint fine-tuning (default in the minimal training entrypoint)')
     parser.add_argument('--disable_validation', action='store_true')
+    parser.add_argument('--drop_bands', nargs='*', choices=['H1', 'H2', 'H3', 'L3'], default=[])
+    parser.add_argument('--drop_scales', nargs='*', type=int, choices=[0, 1, 2, 3], default=[])
+    parser.add_argument('--drop_interval', nargs=2, type=float)
+    parser.add_argument('--gate_override', type=float)
+    parser.add_argument('--wave_strength', type=float, default=1.)
     parser.add_argument('--wave_log_every', type=int, default=10)
 
 
@@ -105,6 +113,10 @@ def wave_inference(brushnet,wave,images,masks,trace=None):
     if len(images) != len(masks):
         raise ValueError('Image/mask batch differs')
     x,m=image_tensors(images,masks,device)
+    input_stats = None
+    if trace is not None:
+        with torch.no_grad():
+            input_stats = wave_input_stats(wave, x, m)
     crossattn = wave.config.get('adapter_type') == 'crossattn'
     features = None
     if not crossattn:
@@ -142,9 +154,25 @@ def wave_inference(brushnet,wave,images,masks,trace=None):
             with torch.autocast(device_type=device.type,enabled=False):
                 gate_tensor=wave.effective_gates(torch.as_tensor(t,device=device).reshape(-1)).detach().float().cpu()
             gates = gate_tensor.numpy().round(8).tolist()
-            # gates=wave.effective_gates(torch.as_tensor(t,device=device).reshape(-1)).detach().float().cpu().tolist()
-            trace.append(dict(call=calls[0],t=float(torch.as_tensor(t).flatten()[0]),gates=gates,
-                              residuals=residual_stats(base,extra),branch_rms=wave.branch_rms(cached,t)))
+
+            residual_rows = residual_stats(base, extra)
+            projected_branch_rms = wave.branch_rms(cached, t)
+            trace_row = dict(
+                call=calls[0],
+                t=float(torch.as_tensor(t).flatten()[0]),
+                gates=gates,
+                gate_summary=gate_summary(gate_tensor),
+                residuals=residual_rows,
+                residual_summary=residual_summary(residual_rows),
+                branch_rms=projected_branch_rms,
+                branch_summary=branch_summary(projected_branch_rms),
+            )
+            # Raw MVWT/q and cached adapter features do not change across diffusion
+            # timesteps in the ordinary cached inference path, so store them once.
+            if calls[0] == 0:
+                trace_row['wave_input'] = input_stats
+                trace_row['feature_stats'] = feature_rms_stats(cached)
+            trace.append(trace_row)
         calls[0]+=1
         merged=merge_residuals(result,extra)
         if isinstance(result,(tuple,list)):
@@ -167,13 +195,189 @@ def residual_stats(base,extra):
         bf,wf=b.detach().float(),w.detach().float()
         br,wr=bf.square().mean().sqrt().item(),wf.square().mean().sqrt().item()
         cross = (bf * wf).mean().item()
-        cosine = torch.nn.functional.cosine_similarity(bf.reshape(1, -1), wf.reshape(1, -1),).item()
+        cosine = torch.nn.functional.cosine_similarity(
+            bf.reshape(1, -1),
+            wf.reshape(1, -1),
+        ).item()
         merged = bf + wf
         merged_rms = merged.square().mean().sqrt().item()
-        rows.append(dict(slot=i,shape=list(b.shape),brush_rms=br,wave_rms=wr,wave_mean=wf.mean().item(),
-                         wave_abs_max=wf.abs().max().item(),ratio=wr/max(br,1e-8), cross_mean=cross,
-                            cosine=cosine,merged_rms=merged_rms,))
+        rows.append(dict(
+            slot=i,
+            shape=list(b.shape),
+            brush_rms=br,
+            wave_rms=wr,
+            wave_mean=wf.mean().item(),
+            wave_abs_max=wf.abs().max().item(),
+            ratio=wr/max(br,1e-8),
+            cross_mean=cross,
+            cosine=cosine,
+            merged_rms=merged_rms,
+            merged_over_brush=merged_rms/max(br,1e-8),
+        ))
     return rows
+
+
+@torch.no_grad()
+def residual_summary(rows):
+    """Compact residual diagnostics for one diffusion timestep."""
+    if not rows:
+        return {}
+    ratios = torch.tensor([r['ratio'] for r in rows], dtype=torch.float32)
+    cosines = torch.tensor([r['cosine'] for r in rows], dtype=torch.float32)
+    merged_ratios = torch.tensor([r['merged_over_brush'] for r in rows], dtype=torch.float32)
+    return {
+        'ratio_mean': float(ratios.mean()),
+        'ratio_median': float(ratios.median()),
+        'ratio_p90': float(torch.quantile(ratios, 0.90)),
+        'ratio_p95': float(torch.quantile(ratios, 0.95)),
+        'ratio_max': float(ratios.max()),
+        'ratio_gt_025': float((ratios > 0.25).float().mean()),
+        'ratio_gt_050': float((ratios > 0.50).float().mean()),
+        'ratio_gt_100': float((ratios > 1.00).float().mean()),
+        'cosine_mean': float(cosines.mean()),
+        'cosine_abs_mean': float(cosines.abs().mean()),
+        'cosine_positive_fraction': float((cosines > 0).float().mean()),
+        'merged_over_brush_mean': float(merged_ratios.mean()),
+        'merged_over_brush_max': float(merged_ratios.max()),
+    }
+
+
+@torch.no_grad()
+def wave_input_stats(wave, image, hole):
+    """Log raw/normalized wave bands and reliability q without changing training."""
+    cfg = wave.config
+    result = {
+        'transform': cfg['transform'],
+        'reliability': cfg['reliability'],
+        'support': cfg['support'],
+        'rms_fitted': bool(wave.rms_fitted.item()),
+        'rms_updates': int(wave.rms_updates.item()),
+        'band_rms_buffer': [float(v) for v in wave.band_rms.detach().float().cpu()],
+    }
+
+    if cfg['transform'] == 'rgb':
+        x = image.detach().float() * (1.0 - hole.detach().float())
+        result['rgb'] = {
+            'rms': float(x.square().mean().sqrt()),
+            'mean': float(x.mean()),
+            'abs_max': float(x.abs().max()),
+        }
+        return result
+
+    bands, qs = haar_pyramid(
+        image,
+        hole,
+        transform=cfg['transform'],
+        support=cfg['support'],
+    )
+    band_stats = {}
+    q_stats = {}
+
+    for i, (name, w, q) in enumerate(zip(BANDS, bands, qs)):
+        wf = w.detach().float()
+        qf = q.detach().float()
+        bstat = {
+            'shape': list(w.shape),
+            'raw_rms': float(wf.square().mean().sqrt()),
+            'raw_mean': float(wf.mean()),
+            'raw_abs_max': float(wf.abs().max()),
+        }
+
+        if i < 3:
+            bstat['direction_rms'] = {
+                'LH': float(wf[:, 0:3].square().mean().sqrt()),
+                'HL': float(wf[:, 3:6].square().mean().sqrt()),
+                'HH': float(wf[:, 6:9].square().mean().sqrt()),
+            }
+            rms = wave.band_rms[i*3:i*3+3].detach().float()
+        else:
+            rms = wave.band_rms[9:10].detach().float()
+
+        denom = rms.repeat_interleave(3)[None, :, None, None].clamp_min(1e-6)
+        wn = wf / denom
+        bstat['normalized_rms'] = float(wn.square().mean().sqrt())
+        band_stats[name] = bstat
+
+        qstat = {
+            'shape': list(q.shape),
+            'mean': float(qf.mean()),
+            'std': float(qf.std(unbiased=False)),
+            'min': float(qf.min()),
+            'max': float(qf.max()),
+            'lt_025_fraction': float((qf < 0.25).float().mean()),
+            'lt_050_fraction': float((qf < 0.50).float().mean()),
+            'gt_075_fraction': float((qf > 0.75).float().mean()),
+            'gt_090_fraction': float((qf > 0.90).float().mean()),
+        }
+        if i < 3 and qf.shape[1] == 3:
+            qstat['direction_mean'] = {
+                'LH': float(qf[:, 0].mean()),
+                'HL': float(qf[:, 1].mean()),
+                'HH': float(qf[:, 2].mean()),
+            }
+        q_stats[name] = qstat
+
+    result['bands'] = band_stats
+    result['reliability_q'] = q_stats
+    return result
+
+
+@torch.no_grad()
+def feature_rms_stats(features):
+    """Adapter cached feature statistics: four bands x four scales."""
+    result = {}
+    for b, name in enumerate(BANDS):
+        result[name] = {}
+        for s, f in enumerate(features[b]):
+            ff = f.detach().float()
+            result[name][f'scale{s}'] = {
+                'shape': list(f.shape),
+                'rms': float(ff.square().mean().sqrt()),
+                'mean': float(ff.mean()),
+                'abs_max': float(ff.abs().max()),
+            }
+    return result
+
+
+@torch.no_grad()
+def branch_summary(branch_values):
+    """Summarize projected per-band RMS. normalized_proxy is descriptive, not additive energy."""
+    if not branch_values:
+        return {}
+    x = torch.tensor(branch_values, dtype=torch.float32)
+    result = {
+        'slot_mean_rms': {
+            name: float(x[:, b].mean()) for b, name in enumerate(BANDS)
+        },
+        'slot_max_rms': {
+            name: float(x[:, b].max()) for b, name in enumerate(BANDS)
+        },
+    }
+    proxy = x.mean(dim=0)
+    total = proxy.sum()
+    if float(total) > 0:
+        proxy = proxy / total
+        result['normalized_proxy'] = {
+            name: float(proxy[b]) for b, name in enumerate(BANDS)
+        }
+    return result
+
+
+@torch.no_grad()
+def gate_summary(g):
+    """Compact band/scale gate statistics for one diffusion timestep."""
+    gf = g.detach().float()
+    return {
+        'mean': float(gf.mean()),
+        'min': float(gf.min()),
+        'max': float(gf.max()),
+        'band_mean': {
+            BANDS[b]: float(gf[:, b, :].mean()) for b in range(4)
+        },
+        'scale_mean': {
+            f'scale{s}': float(gf[:, :, s].mean()) for s in range(4)
+        },
+    }
 
 
 def append_jsonl(path,row):
