@@ -149,7 +149,7 @@ def main(evaluate=False):
                 masks = [mask for _,mask in pairs]
                 generators = [torch.Generator(device=acc.device).manual_seed(
                     a.seed if a.seed_policy == 'same' else sample_seed(a.seed,r['id'])) for r in pending]
-                with torch.inference_mode(), wave_inference(base,wave,images,masks):
+                with torch.inference_mode(), wave_inference(base,wave,images,masks,unet=pipe.unet):
                     results = pipe([r.get('caption','') for r in pending], images, masks,
                                    num_inference_steps=a.num_inference_steps, generator=generators,
                                    guidance_scale=a.guidance_scale, **{scale_name:a.scale}).images

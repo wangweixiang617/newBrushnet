@@ -123,7 +123,7 @@ class UNetAdapter(nn.Module):
     Input/output contract is identical to Adapter: input is already 64x64 and forward returns
     four feature maps at 64/32/16/8 with channels given by widths.
     """
-    def __init__(self, channels, widths):
+    def __init__(self, channels, widths, temb_channels=None):
         super().__init__()
         try:
             from diffusers.models.unets.unet_2d_blocks import DownBlock2D
@@ -158,18 +158,18 @@ class UNetAdapter(nn.Module):
         self.downsamplers = nn.ModuleList()
         in_ch = widths[0]
         for i, out_ch in enumerate(widths):
-            self.blocks.append(DownBlock2D(in_channels=in_ch, out_channels=out_ch, temb_channels=None, num_layers=2,
+            self.blocks.append(DownBlock2D(in_channels=in_ch, out_channels=out_ch, temb_channels=temb_channels, num_layers=2,
                                            add_downsample=False, resnet_eps=1e-5, resnet_act_fn='silu',
                                            resnet_groups=groups(in_ch, out_ch)))
             if i < len(widths)-1:
                 self.downsamplers.append(Downsample2D(out_ch, use_conv=True, out_channels=out_ch, padding=1, name='op'))
             in_ch = out_ch
 
-    def forward(self, x):
+    def forward(self, x, temb=None):
         x = self.stem(x)
         out = []
         for i, block in enumerate(self.blocks):
-            x, _ = block(x, temb=None)
+            x, _ = block(x, temb=temb)
             out.append(x)
             if i < len(self.downsamplers):
                 x = self.downsamplers[i](x)
@@ -186,9 +186,9 @@ class SelfAttnUNetAdapter(nn.Module):
       H3:  12 -> 64
       L3:   4 -> 64
     The adapter returns four feature maps at 64/32/16/8 with channels=widths.
-    No encoder_hidden_states and no extra timestep embedding are required.
+    Optional temb uses the native ResNet timestep-conditioning path from diffusers.
     """
-    def __init__(self, channels, widths, attention_head_dim=8):
+    def __init__(self, channels, widths, attention_head_dim=8, temb_channels=None):
         super().__init__()
         try:
             from diffusers.models.unets.unet_2d_blocks import AttnDownBlock2D
@@ -231,7 +231,7 @@ class SelfAttnUNetAdapter(nn.Module):
                 AttnDownBlock2D(
                     in_channels=in_ch,
                     out_channels=out_ch,
-                    temb_channels=None,
+                    temb_channels=temb_channels,
                     num_layers=2,
                     resnet_eps=1e-5,
                     resnet_act_fn='silu',
@@ -246,11 +246,11 @@ class SelfAttnUNetAdapter(nn.Module):
                 )
             in_ch = out_ch
 
-    def forward(self, x):
+    def forward(self, x, temb=None):
         x = self.stem(x)
         out = []
         for i, block in enumerate(self.blocks):
-            x, _ = block(hidden_states=x, temb=None)
+            x, _ = block(hidden_states=x, temb=temb)
             out.append(x)
             if i < len(self.downsamplers):
                 x = self.downsamplers[i](x)
@@ -268,7 +268,7 @@ class HybridSelfAttnUNetAdapter(nn.Module):
 
     Existing SelfAttnUNetAdapter and CrossAttnUNetAdapter are left unchanged.
     """
-    def __init__(self, channels, widths, attention_head_dim=8):
+    def __init__(self, channels, widths, attention_head_dim=8, temb_channels=None):
         super().__init__()
         try:
             from diffusers.models.unets.unet_2d_blocks import DownBlock2D, AttnDownBlock2D
@@ -321,7 +321,7 @@ class HybridSelfAttnUNetAdapter(nn.Module):
                 block = DownBlock2D(
                     in_channels=in_ch,
                     out_channels=out_ch,
-                    temb_channels=None,
+                    temb_channels=temb_channels,
                     num_layers=2,
                     add_downsample=False,
                     resnet_eps=1e-5,
@@ -332,7 +332,7 @@ class HybridSelfAttnUNetAdapter(nn.Module):
                 block = AttnDownBlock2D(
                     in_channels=in_ch,
                     out_channels=out_ch,
-                    temb_channels=None,
+                    temb_channels=temb_channels,
                     num_layers=2,
                     resnet_eps=1e-5,
                     resnet_act_fn='silu',
@@ -355,12 +355,12 @@ class HybridSelfAttnUNetAdapter(nn.Module):
                 )
             in_ch = out_ch
 
-    def forward(self, x):
+    def forward(self, x, temb=None):
         x = self.stem(x)
         out = []
 
         for i, block in enumerate(self.blocks):
-            x, _ = block(hidden_states=x, temb=None)
+            x, _ = block(hidden_states=x, temb=temb)
             out.append(x)
 
             if i < len(self.downsamplers):
@@ -503,7 +503,7 @@ class WaveConditioner(nn.Module):
                  widths=(32,64,96,128), gate_max=1., gate_init=.5, timesteps=1000, soft_lambda=.5,
                  shared=False, coarse_only=False, adapter_type='legacy', cross_attention_dim=768,
                  cross_attention_heads=8, drop_bands=None, drop_scales=None, drop_interval=None,
-                 gate_override=None, wave_strength=1.):
+                 gate_override=None, wave_strength=1., temb_channels=None):
         super().__init__()
         if reliability not in ('none', 'concat', 'premul', 'soft'):
             raise ValueError('Unknown reliability mode')
@@ -517,10 +517,17 @@ class WaveConditioner(nn.Module):
             raise ValueError('selfattn band-specific stem requires shared=False')
         if adapter_type == 'hybrid' and shared:
             raise ValueError('hybrid band-specific stem requires shared=False')
+        if temb_channels is not None:
+            temb_channels = int(temb_channels)
+            if temb_channels < 1:
+                raise ValueError('temb_channels must be positive')
+            if adapter_type not in ('unet', 'selfattn', 'hybrid'):
+                raise ValueError('SD timestep conditioning supports unet/selfattn/hybrid adapters only')
         self.config = dict(spec=spec, transform=transform, reliability=reliability, gate=gate, support=support,
                            widths=list(widths), gate_max=gate_max, gate_init=gate_init, timesteps=timesteps,
                            soft_lambda=soft_lambda, shared=shared, coarse_only=coarse_only, adapter_type=adapter_type,
-                           cross_attention_dim=cross_attention_dim, cross_attention_heads=cross_attention_heads)
+                           cross_attention_dim=cross_attention_dim, cross_attention_heads=cross_attention_heads,
+                           temb_channels=temb_channels)
         self.spec = spec
         # Non-gradient RMS buffers; EMA updates occur only after successful optimizer steps.
         self.register_buffer('band_rms', torch.ones(10))
@@ -533,11 +540,11 @@ class WaveConditioner(nn.Module):
             if adapter_type == 'legacy':
                 return Adapter(c, widths)
             if adapter_type == 'unet':
-                return UNetAdapter(c, widths)
+                return UNetAdapter(c, widths, temb_channels=temb_channels)
             if adapter_type == 'selfattn':
-                return SelfAttnUNetAdapter(c, widths, attention_head_dim=8)
+                return SelfAttnUNetAdapter(c, widths, attention_head_dim=8, temb_channels=temb_channels)
             if adapter_type == 'hybrid':
-                return HybridSelfAttnUNetAdapter(c, widths, attention_head_dim=8)
+                return HybridSelfAttnUNetAdapter(c, widths, attention_head_dim=8, temb_channels=temb_channels)
             return CrossAttnUNetAdapter(c, widths, cross_attention_dim, cross_attention_heads)
 
         if shared:
@@ -635,7 +642,7 @@ class WaveConditioner(nn.Module):
         self.rms_second_moment.copy_(values.square())
         self.rms_fitted.fill_(True)
 
-    def encode(self, image, hole, encoder_hidden_states=None):
+    def encode(self, image, hole, encoder_hidden_states=None, temb=None):
         if image.shape[-1] % 64 or image.shape[-2] % 64:
             raise ValueError('Image H/W must be divisible by 64 for four UNet scales')
         cfg = self.config
@@ -658,6 +665,14 @@ class WaveConditioner(nn.Module):
                 if cfg['coarse_only'] and i < 2:
                     x = torch.zeros_like(x)
                 inputs.append(F.pixel_unshuffle(x,r).to(dtype))
+        temporal = cfg.get('temb_channels') is not None
+        if temporal:
+            if temb is None:
+                raise ValueError('Time-conditioned wave adapter requires SD timestep embedding')
+            if temb.ndim != 2 or temb.shape[0] != image.shape[0] or temb.shape[-1] != cfg['temb_channels']:
+                raise ValueError(
+                    f'Expected temb [B,{cfg["temb_channels"]}] for batch {image.shape[0]}, got {tuple(temb.shape)}'
+                )
         if cfg['adapter_type'] == 'crossattn':
             if encoder_hidden_states is None:
                 raise ValueError('crossattn adapter requires encoder_hidden_states')
@@ -666,9 +681,15 @@ class WaveConditioner(nn.Module):
             else:
                 features = [adapter(x, encoder_hidden_states) for adapter,x in zip(self.adapters,inputs)]
         elif cfg['shared']:
-            features = [self.adapters[0](proj(x)) for proj,x in zip(self.projections,inputs)]
+            if temporal:
+                features = [self.adapters[0](proj(x), temb=temb) for proj,x in zip(self.projections,inputs)]
+            else:
+                features = [self.adapters[0](proj(x)) for proj,x in zip(self.projections,inputs)]
         else:
-            features = [adapter(x) for adapter,x in zip(self.adapters,inputs)]
+            if temporal:
+                features = [adapter(x, temb=temb) for adapter,x in zip(self.adapters,inputs)]
+            else:
+                features = [adapter(x) for adapter,x in zip(self.adapters,inputs)]
         if cfg['coarse_only']:
             features[:2] = [[f*0 for f in branch] for branch in features[:2]]
         return features
@@ -729,8 +750,8 @@ class WaveConditioner(nn.Module):
             rows.append(values)
         return rows
 
-    def forward(self, image, hole, timesteps, encoder_hidden_states=None):
-        return self.project(self.encode(image,hole,encoder_hidden_states),timesteps)
+    def forward(self, image, hole, timesteps, encoder_hidden_states=None, temb=None):
+        return self.project(self.encode(image, hole, encoder_hidden_states, temb=temb), timesteps)
 
     def save_pretrained(self, path):
         path = Path(path)

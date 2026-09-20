@@ -44,7 +44,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
 from wavebrush.validation_evaluator import BrushNetValidationEvaluator
-from wavebrush.integration import add_wave_args, build_wave, wave_inference
+from wavebrush.integration import add_wave_args, build_wave, wave_inference, sd_time_embedding
 from wavebrush.core import merge_residuals
 from wavebrush.rms import RMSAccumulator, initialize_rms_from_loader
 from wavebrush.runtime import register_model_hooks, validation_guard
@@ -185,7 +185,7 @@ def log_validation_evaluator(
             # 后续 batch 直接传 None
             batch_trace = [] if (not trace_saved and wave is not None) else None
             with torch.no_grad(), accelerator.autocast(), wave_inference(
-                brushnet, wave, batch_conditioning_images, batch_mask_images, trace= batch_trace
+                brushnet, wave, batch_conditioning_images, batch_mask_images, trace=batch_trace, unet=pipeline.unet
             ):
                 batch_result = pipeline(
                     batch_prompts,
@@ -1198,7 +1198,7 @@ def main(args):
 
     # Register both BrushNet and wave for the original Accelerator checkpoint flow.
     register_model_hooks(accelerator)
-    wave = build_wave(brushnet, args, accelerator.device, noise_scheduler.config.num_train_timesteps)
+    wave = build_wave(brushnet, args, accelerator.device, noise_scheduler.config.num_train_timesteps, unet=unet)
     brushnet.requires_grad_(args.train_brushnet)
     rms_accumulator = RMSAccumulator(accelerator.device, args.rms_mode, args.rms_ema_decay)
 
@@ -1607,7 +1607,15 @@ def main(args):
                 )
 
                 if wave is not None:
-                    extra = wave(batch['conditioning_pixel_values'], 1-batch['masks'], timesteps, encoder_hidden_states=encoder_hidden_states)
+                    wave_temb = None
+                    if args.wave_use_sd_temb:
+                        wave_temb = sd_time_embedding(
+                            unet, timesteps, bsz, device=latents.device, dtype=next(wave.parameters()).dtype
+                        )
+                    extra = wave(
+                        batch['conditioning_pixel_values'], 1-batch['masks'], timesteps,
+                        encoder_hidden_states=encoder_hidden_states, temb=wave_temb
+                    )
                     down_block_res_samples, mid_block_res_sample, up_block_res_samples = merge_residuals(
                         (down_block_res_samples, mid_block_res_sample, up_block_res_samples), extra)
                     rms_accumulator.add(batch['pixel_values'])

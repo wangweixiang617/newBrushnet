@@ -47,8 +47,11 @@ print("NSFW safety checker:", pipe.safety_checker)
 pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
 # remove following line if xformers is not installed or when using Torch 2.0.
 # pipe.enable_xformers_memory_efficient_attention()
-# memory optimization.
-pipe.enable_model_cpu_offload()
+# Temporal Wave directly reuses pipe.unet time_embedding each denoising step, so keep UNet on CUDA.
+if wave is not None and wave.config.get('temb_channels') is not None:
+    pipe = pipe.to('cuda')
+else:
+    pipe.enable_model_cpu_offload()
 
 original_image_np = cv2.imread(image_path)[:,:,::-1]
 mask_image = 1.*(cv2.imread(mask_path).sum(-1)>255)[:,:,np.newaxis]
@@ -61,7 +64,7 @@ mask_image = Image.fromarray(mask_image.astype(np.uint8).repeat(3,-1)*255).conve
 generator = torch.Generator("cuda").manual_seed(1234)
 
 torch.manual_seed(1234)  # Also controls VAE condition sampling in the official pipeline.
-with torch.no_grad(), wave_inference(pipe.brushnet, wave, [init_image], [mask_image]):
+with torch.no_grad(), wave_inference(pipe.brushnet, wave, [init_image], [mask_image], unet=pipe.unet):
     image = pipe(
         caption, 
         init_image, 

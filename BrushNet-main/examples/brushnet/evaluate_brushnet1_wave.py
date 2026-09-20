@@ -263,7 +263,7 @@ for batch_start in range(0, len(mapping_items), batch_size):
     # Official pipeline VAE sampling also consumes the global torch RNG.
     torch.manual_seed(args.seed)
     trace = [] if args.trace_wave else None
-    with torch.no_grad(), wave_inference(pipe.brushnet, wave, init_images, mask_images, trace=trace):
+    with torch.no_grad(), wave_inference(pipe.brushnet, wave, init_images, mask_images, trace=trace, unet=pipe.unet):
         result = pipe(
             captions,
             init_images,

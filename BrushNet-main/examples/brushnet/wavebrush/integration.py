@@ -18,6 +18,8 @@ def add_wave_args(parser):
     parser.add_argument('--wave_resume', type=str, help='Warm-start wave folder; not optimizer resume')
     parser.add_argument('--wave_widths', type=int, nargs=4, default=[32,64,96,128])
     parser.add_argument('--wave_adapter', choices=['legacy','unet','selfattn','hybrid','crossattn'], default='unet')
+    parser.add_argument('--wave_use_sd_temb', action='store_true',
+                        help='Use frozen SD UNet timestep embedding inside Wave UNet/selfattn/hybrid adapters')
     parser.add_argument('--wave_gate', choices=['fixed','constant','time'])
     parser.add_argument('--wave_gate_max', type=float, default=2.)
     parser.add_argument('--wave_gate_init', type=float, default=1.)
@@ -36,8 +38,42 @@ def add_wave_args(parser):
     parser.add_argument('--wave_log_every', type=int, default=10)
 
 
+def sd_time_embed_dim(unet):
+    """Dimension of the frozen SD UNet timestep embedding consumed by its ResNet blocks."""
+    if unet is None or not hasattr(unet, 'time_embedding'):
+        raise ValueError('SD UNet with time_embedding is required for --wave_use_sd_temb')
+    linear_2 = getattr(unet.time_embedding, 'linear_2', None)
+    if linear_2 is None or not hasattr(linear_2, 'out_features'):
+        raise ValueError('Unsupported SD UNet time_embedding; expected TimestepEmbedding.linear_2')
+    return int(linear_2.out_features)
+
+
 @torch.no_grad()
-def build_wave(brushnet, args, device, timesteps=1000):
+def sd_time_embedding(unet, timestep, batch_size, device, dtype):
+    """Compute the same frozen SD UNet time embedding for Wave adapter conditioning."""
+    if unet is None:
+        raise ValueError('SD UNet is required for time-conditioned Wave')
+    t = torch.as_tensor(timestep).reshape(-1)
+    if t.numel() == 1:
+        t = t.expand(batch_size)
+    if t.numel() != batch_size:
+        raise ValueError(f'Timestep batch {t.numel()} != sample batch {batch_size}')
+    try:
+        param = next(unet.time_embedding.parameters())
+    except StopIteration as exc:
+        raise ValueError('SD UNet time_embedding has no parameters') from exc
+    emb_device, emb_dtype = param.device, param.dtype
+    t = t.to(emb_device)
+    t_emb = unet.time_proj(t).to(device=emb_device, dtype=emb_dtype)
+    emb = unet.time_embedding(t_emb)
+    time_embed_act = getattr(unet, 'time_embed_act', None)
+    if time_embed_act is not None:
+        emb = time_embed_act(emb)
+    return emb.to(device=device, dtype=dtype)
+
+
+@torch.no_grad()
+def build_wave(brushnet, args, device, timesteps=1000, unet=None):
     if args.wave_preset == 'B0':
         return None
     # Probe the actual fork rather than assuming down/mid/up slot counts or channels.
@@ -57,10 +93,13 @@ def build_wave(brushnet, args, device, timesteps=1000):
                       brushnet_cond=torch.zeros(1,5,res//8,res//8,device=device,dtype=p.dtype),return_dict=False)
     spec = slot_spec(result,(res//8,res//8))
     brushnet.train(mode)
+    temb_channels = sd_time_embed_dim(unet) if args.wave_use_sd_temb else None
     if args.wave_resume:
         wave = WaveConditioner.from_pretrained(args.wave_resume,device)
         if wave.spec != spec:
             raise ValueError('Saved wave residual schema differs from current BrushNet')
+        if wave.config.get('temb_channels') != temb_channels:
+            raise ValueError('Wave warm-start temporal configuration differs; use a matching wave or start fresh')
     else:
         options = dict(PRESETS[args.wave_preset])
         if args.wave_gate:
@@ -70,7 +109,8 @@ def build_wave(brushnet, args, device, timesteps=1000):
         wave = WaveConditioner(spec,**options,widths=args.wave_widths,support=args.wave_support,
                                gate_max=args.wave_gate_max,gate_init=args.wave_gate_init,timesteps=timesteps,
                                soft_lambda=args.wave_soft_lambda,shared=args.wave_shared,coarse_only=args.wave_coarse_only,
-                               adapter_type=args.wave_adapter,cross_attention_dim=cross_dim,cross_attention_heads=8).to(device)
+                               adapter_type=args.wave_adapter,cross_attention_dim=cross_dim,cross_attention_heads=8,
+                               temb_channels=temb_channels).to(device)
         if options['transform'] != 'rgb' and args.wave_rms:
             data = json.loads(Path(args.wave_rms).read_text())
             if data.get('resolution') != args.resolution:
@@ -106,7 +146,7 @@ def image_tensors(images, masks, device, size=None):
 
 
 @contextmanager
-def wave_inference(brushnet,wave,images,masks,trace=None):
+def wave_inference(brushnet,wave,images,masks,trace=None,unet=None):
     """One pipeline call, num_images_per_prompt=1; standard CFG [uncond batch, cond batch].
     Single BrushNet only. guess_mode/global_pool_conditions are deliberately rejected.
     Restores hook and training mode even when inference raises an exception.
@@ -115,7 +155,7 @@ def wave_inference(brushnet,wave,images,masks,trace=None):
         yield
         return
     if torch.is_grad_enabled():
-        # Inference uses a detached cache; training must call wave(image, hole, t) normally.
+        # Static models cache adapter features; temporal models recompute the adapter at every timestep.
         pass
     device=next(wave.parameters()).device
     old_mode=wave.training
@@ -128,8 +168,13 @@ def wave_inference(brushnet,wave,images,masks,trace=None):
         with torch.no_grad():
             input_stats = wave_input_stats(wave, x, m)
     crossattn = wave.config.get('adapter_type') == 'crossattn'
+    temporal = wave.config.get('temb_channels') is not None
+    if temporal and unet is None:
+        raise ValueError('Time-conditioned Wave requires unet=pipe.unet in wave_inference')
+    if temporal and crossattn:
+        raise ValueError('SD timestep conditioning is supported only for unet/selfattn/hybrid Wave adapters')
     features = None
-    if not crossattn:
+    if not crossattn and not temporal:
         with torch.no_grad():
             features=wave.encode(x,m)
     cross_cache = {}
@@ -144,7 +189,15 @@ def wave_inference(brushnet,wave,images,masks,trace=None):
         n=sample.shape[0]
         if n not in (batch,2*batch):
             raise ValueError('Only num_images_per_prompt=1 and ordinary CFG are supported')
-        if crossattn:
+        if temporal:
+            xi = x if n == batch else x.repeat(2,1,1,1)
+            mi = m if n == batch else m.repeat(2,1,1,1)
+            temb = sd_time_embedding(
+                unet, t, n, device=device, dtype=next(wave.adapters.parameters()).dtype
+            )
+            with torch.no_grad():
+                cached = wave.encode(xi, mi, temb=temb)
+        elif crossattn:
             encoder_hidden_states = kwargs.get('encoder_hidden_states')
             if encoder_hidden_states is None:
                 raise ValueError('crossattn wave adapter requires BrushNet encoder_hidden_states')
@@ -177,10 +230,10 @@ def wave_inference(brushnet,wave,images,masks,trace=None):
                 branch_rms=projected_branch_rms,
                 branch_summary=branch_summary(projected_branch_rms),
             )
-            # Raw MVWT/q and cached adapter features do not change across diffusion
-            # timesteps in the ordinary cached inference path, so store them once.
             if calls[0] == 0:
                 trace_row['wave_input'] = input_stats
+            # Temporal adapters are recomputed for every diffusion timestep; static features are logged once.
+            if temporal or calls[0] == 0:
                 trace_row['feature_stats'] = feature_rms_stats(cached)
             trace.append(trace_row)
         calls[0]+=1
