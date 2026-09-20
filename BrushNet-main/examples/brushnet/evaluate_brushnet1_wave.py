@@ -159,12 +159,13 @@ wave = None if args.disable_wave else WaveConditioner.from_pretrained(
     args.wave_path or os.path.join(brushnet_path, "wave"), device).eval()
 
 if wave is not None:
-    wave.drop_bands = {['H1','H2','H3','L3'].index(b) for b in args.drop_bands}
-    wave.drop_scales = set(args.drop_scales)
-    wave.drop_interval = args.drop_interval
-    wave.strength = args.wave_strength
-    if args.gate_override is not None:
-        wave.gate_override = torch.full((4,4), args.gate_override, device=device)
+    wave.set_interventions(
+        drop_bands=args.drop_bands,
+        drop_scales=args.drop_scales,
+        drop_interval=args.drop_interval,
+        gate_override=args.gate_override,
+        wave_strength=args.wave_strength,
+    )
 
 brushnet = BrushNetModel.from_pretrained(brushnet_path, torch_dtype=torch.float16).to(device)
 pipe = StableDiffusionBrushNetPipeline.from_pretrained(

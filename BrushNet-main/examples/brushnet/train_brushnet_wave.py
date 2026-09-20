@@ -246,7 +246,7 @@ def log_validation_evaluator(
     validation_metrics = None
     if validation_evaluator is not None and len(metric_samples) > 0:
         # final validation 一定计算完整 7 个指标
-        run_full_metrics = is_final_validation
+        run_full_metrics = is_final_validation or step == 1
 
         # 训练中每 N step 计算完整指标
         if (
@@ -1701,7 +1701,7 @@ def main(args):
                     accelerator.wait_for_everyone()
                     logger.info(f"Saved state to {save_path}")
 
-                if args.validation_prompt is not None and global_step % args.validation_steps == 0:
+                if args.validation_prompt is not None and (global_step % args.validation_steps == 0  or global_step == 1):
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         image_logs = log_validation_evaluator(
@@ -1731,7 +1731,7 @@ def main(args):
 
             # TensorBoard
             if accelerator.sync_gradients:
-                if wave is not None and args.wave_log_every > 0 and global_step % args.wave_log_every == 0:
+                if (wave is not None and args.wave_log_every > 0 and global_step % args.wave_log_every == 0 or global_step == 1):
                     raw = unwrap_model(wave)
                     logs.update({f'wave_rms/rms_{i}': float(v) for i, v in enumerate(raw.band_rms)})
                     logs['wave_rms/rms_updates'] = int(raw.rms_updates)

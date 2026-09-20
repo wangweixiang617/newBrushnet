@@ -61,21 +61,31 @@ def build_wave(brushnet, args, device, timesteps=1000):
         wave = WaveConditioner.from_pretrained(args.wave_resume,device)
         if wave.spec != spec:
             raise ValueError('Saved wave residual schema differs from current BrushNet')
-        return wave
-    options = dict(PRESETS[args.wave_preset])
-    if args.wave_gate:
-        options['gate'] = args.wave_gate
-    if args.wave_reliability:
-        options['reliability'] = args.wave_reliability
-    wave = WaveConditioner(spec,**options,widths=args.wave_widths,support=args.wave_support,
-                           gate_max=args.wave_gate_max,gate_init=args.wave_gate_init,timesteps=timesteps,
-                           soft_lambda=args.wave_soft_lambda,shared=args.wave_shared,coarse_only=args.wave_coarse_only,
-                           adapter_type=args.wave_adapter,cross_attention_dim=cross_dim,cross_attention_heads=8).to(device)
-    if options['transform'] != 'rgb' and args.wave_rms:
-        data = json.loads(Path(args.wave_rms).read_text())
-        if data.get('resolution') != args.resolution:
-            raise ValueError('RMS resolution differs from training resolution')
-        wave.set_rms(args.wave_rms)
+    else:
+        options = dict(PRESETS[args.wave_preset])
+        if args.wave_gate:
+            options['gate'] = args.wave_gate
+        if args.wave_reliability:
+            options['reliability'] = args.wave_reliability
+        wave = WaveConditioner(spec,**options,widths=args.wave_widths,support=args.wave_support,
+                               gate_max=args.wave_gate_max,gate_init=args.wave_gate_init,timesteps=timesteps,
+                               soft_lambda=args.wave_soft_lambda,shared=args.wave_shared,coarse_only=args.wave_coarse_only,
+                               adapter_type=args.wave_adapter,cross_attention_dim=cross_dim,cross_attention_heads=8).to(device)
+        if options['transform'] != 'rgb' and args.wave_rms:
+            data = json.loads(Path(args.wave_rms).read_text())
+            if data.get('resolution') != args.resolution:
+                raise ValueError('RMS resolution differs from training resolution')
+            wave.set_rms(args.wave_rms)
+
+    # Apply current-run interventions for both fresh construction and --wave_resume.
+    # set_interventions() also stores a canonical JSON-safe copy in wave.config.
+    wave.set_interventions(
+        drop_bands=args.drop_bands,
+        drop_scales=args.drop_scales,
+        drop_interval=args.drop_interval,
+        gate_override=args.gate_override,
+        wave_strength=args.wave_strength,
+    )
     return wave
 
 
@@ -250,6 +260,11 @@ def wave_input_stats(wave, image, hole):
         'transform': cfg['transform'],
         'reliability': cfg['reliability'],
         'support': cfg['support'],
+        'drop_bands': cfg.get('drop_bands', []),
+        'drop_scales': cfg.get('drop_scales', []),
+        'drop_interval': cfg.get('drop_interval'),
+        'gate_override': cfg.get('gate_override'),
+        'wave_strength': cfg.get('wave_strength', 1.0),
         'rms_fitted': bool(wave.rms_fitted.item()),
         'rms_updates': int(wave.rms_updates.item()),
         'band_rms_buffer': [float(v) for v in wave.band_rms.detach().float().cpu()],

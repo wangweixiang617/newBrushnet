@@ -127,12 +127,13 @@ def main(evaluate=False):
         if wave is not None:
             if wave.config['timesteps'] != pipe.scheduler.config.num_train_timesteps:
                 raise ValueError('Wave and diffusion scheduler training timestep count differs')
-            wave.drop_bands = {['H1','H2','H3','L3'].index(b) for b in a.drop_bands}
-            wave.drop_scales = set(a.drop_scales)
-            wave.drop_interval = a.drop_interval
-            wave.strength = a.wave_strength
-            if a.gate_override is not None:
-                wave.gate_override = torch.full((4,4), a.gate_override, device=acc.device)
+            wave.set_interventions(
+                drop_bands=a.drop_bands,
+                drop_scales=a.drop_scales,
+                drop_interval=a.drop_interval,
+                gate_override=a.gate_override,
+                wave_strength=a.wave_strength,
+            )
         parameters = inspect.signature(pipe.__call__).parameters
         scale_name = 'brushnet_conditioning_scale' if 'brushnet_conditioning_scale' in parameters else 'paintingnet_conditioning_scale'
         if scale_name not in parameters:

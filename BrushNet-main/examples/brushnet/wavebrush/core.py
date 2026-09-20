@@ -501,7 +501,9 @@ class Gates(nn.Module):
 class WaveConditioner(nn.Module):
     def __init__(self, spec, transform='mvwt', reliability='concat', gate='time', support='directional',
                  widths=(32,64,96,128), gate_max=1., gate_init=.5, timesteps=1000, soft_lambda=.5,
-                 shared=False, coarse_only=False, adapter_type='legacy', cross_attention_dim=768, cross_attention_heads=8):
+                 shared=False, coarse_only=False, adapter_type='legacy', cross_attention_dim=768,
+                 cross_attention_heads=8, drop_bands=None, drop_scales=None, drop_interval=None,
+                 gate_override=None, wave_strength=1.):
         super().__init__()
         if reliability not in ('none', 'concat', 'premul', 'soft'):
             raise ValueError('Unknown reliability mode')
@@ -548,12 +550,73 @@ class WaveConditioner(nn.Module):
         self.zero = nn.ModuleList(nn.Conv2d(4*widths[s['scale']], s['channels'], 1, bias=False) for s in spec['slots'])
         for layer in self.zero:
             nn.init.zeros_(layer.weight)
-        # Evaluation-only interventions; persisted configurations remain unchanged.
-        self.drop_bands = set()
-        self.drop_scales = set()
-        self.drop_interval = None  # normalized forward t in [0,1]; large t is early denoising
-        self.gate_override = None
-        self.strength = 1.
+        # Runtime interventions contain no learned parameters, but are persisted in config.json
+        # so ablation/training settings remain inspectable and round-trip through checkpoints.
+        self.set_interventions(
+            drop_bands=drop_bands,
+            drop_scales=drop_scales,
+            drop_interval=drop_interval,
+            gate_override=gate_override,
+            wave_strength=wave_strength,
+        )
+
+    def set_interventions(self, drop_bands=None, drop_scales=None, drop_interval=None,
+                          gate_override=None, wave_strength=1.):
+        """Configure band/scale/time interventions and persist a JSON-safe canonical form.
+
+        `drop_bands` is stored by band name in config but converted to integer indices at runtime.
+        `drop_scales` is sorted/canonicalized because order has no semantic meaning.
+        `gate_override` is stored as a scalar (not a Tensor) so config.json remains serializable.
+        """
+        drop_bands = [] if drop_bands is None else list(drop_bands)
+        drop_scales = [] if drop_scales is None else list(drop_scales)
+
+        unknown_bands = [b for b in drop_bands if b not in BANDS]
+        if unknown_bands:
+            raise ValueError(f'Unknown drop bands: {unknown_bands}')
+        # Stable ordering prevents false config mismatches when equivalent CLI orders differ.
+        band_set = set(drop_bands)
+        drop_bands = [name for name in BANDS if name in band_set]
+
+        try:
+            drop_scales = [int(s) for s in drop_scales]
+        except (TypeError, ValueError) as exc:
+            raise ValueError('drop_scales must contain integers') from exc
+        invalid_scales = [s for s in drop_scales if s not in range(4)]
+        if invalid_scales:
+            raise ValueError(f'Invalid drop scales: {invalid_scales}')
+        drop_scales = sorted(set(drop_scales))
+
+        if drop_interval is not None:
+            if len(drop_interval) != 2:
+                raise ValueError('drop_interval must contain [lo, hi]')
+            lo, hi = map(float, drop_interval)
+            if not 0.0 <= lo <= hi <= 1.0:
+                raise ValueError('drop_interval requires 0 <= lo <= hi <= 1')
+            drop_interval = [lo, hi]
+
+        if gate_override is not None:
+            gate_override = float(gate_override)
+            if not math.isfinite(gate_override):
+                raise ValueError('gate_override must be finite')
+
+        wave_strength = float(wave_strength)
+        if not math.isfinite(wave_strength) or wave_strength < 0:
+            raise ValueError('wave_strength must be finite and >= 0')
+
+        self.drop_bands = {BANDS.index(name) for name in drop_bands}
+        self.drop_scales = set(drop_scales)
+        self.drop_interval = None if drop_interval is None else tuple(drop_interval)
+        self.gate_override = gate_override
+        self.strength = wave_strength
+
+        self.config.update({
+            'drop_bands': drop_bands,
+            'drop_scales': drop_scales,
+            'drop_interval': drop_interval,
+            'gate_override': gate_override,
+            'wave_strength': wave_strength,
+        })
 
     def _apply(self, fn):
         super()._apply(fn)
@@ -614,7 +677,7 @@ class WaveConditioner(nn.Module):
         batch = len(t)
         g = self.gates(t)
         if self.gate_override is not None:
-            g = self.gate_override.to(g).reshape(1,4,4).expand(batch,-1,-1)
+            g = torch.full_like(g, self.gate_override)
         # If both a band and time window are selected, drop only that band IN that window.
         selected = torch.ones_like(g, dtype=torch.bool)
         if self.drop_bands:
