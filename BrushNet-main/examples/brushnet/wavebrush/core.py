@@ -10,7 +10,7 @@ import torch.nn.functional as F
 BANDS = ('H1', 'H2', 'H3', 'L3')
 PRESETS = {
     'B1_rgb': dict(transform='rgb', reliability='none', gate='fixed'),
-    'B2_dwt': dict(transform='dwt', reliability='none', gate='fixed'),
+    'B2_dwt': dict(transform='dwt', reliability='concat', gate='fixed'),
     'B3_mvwt': dict(transform='mvwt', reliability='none', gate='fixed'),
     'B4_concat': dict(transform='mvwt', reliability='concat', gate='fixed'),
     'B5_premul': dict(transform='mvwt', reliability='premul', gate='fixed'),
