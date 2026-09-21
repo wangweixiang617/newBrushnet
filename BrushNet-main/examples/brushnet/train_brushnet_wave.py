@@ -1750,13 +1750,74 @@ def main(args):
             # Progress bar
             progress_bar.set_postfix(**logs, refresh=False,)#不能刷新不然可能会出很多条
 
-            # TensorBoard
+            # TensorBoard + Wave envelope diagnostics
             if accelerator.sync_gradients:
                 logs['diff_loss'] = diff_loss.detach().float().item()
+
                 if env_terms is not None:
+                    # Keep every envelope statistic in TensorBoard.
                     for key, value in env_terms.items():
                         logs[f'wave_env/{key}'] = value.detach().float().item()
-                if (wave is not None and args.wave_log_every > 0 and global_step % args.wave_log_every == 0 or global_step == 1):
+
+                    # Also print a compact, human-readable envelope summary.
+                    # Reuse --wave_log_every; no additional CLI argument is needed.
+                    should_log_env = (
+                        global_step == 1
+                        or (
+                            args.wave_log_every > 0
+                            and global_step % args.wave_log_every == 0
+                        )
+                    )
+                    if accelerator.is_main_process and should_log_env and (global_step % args.validation_steps == 0  or global_step == 1):
+                        env_log_parts = []
+                        if 'total' in env_terms:
+                            env_log_parts.append(
+                                f"total={env_terms['total'].detach().float().item():.6f}"
+                            )
+
+                        for region in ('global', 'known', 'hole'):
+                            loss_key = f'{region}_loss'
+                            # Disabled regions (weight == 0) are not present in env_terms.
+                            if loss_key not in env_terms:
+                                continue
+
+                            region_loss = env_terms[loss_key].detach().float().item()
+                            weighted = env_terms[f'{region}_weighted'].detach().float().item()
+                            valid_fraction = env_terms[f'{region}_valid_fraction'].detach().float().item()
+                            active_fraction = env_terms[f'{region}_active_fraction'].detach().float().item()
+                            over_cap_fraction = env_terms[f'{region}_over_cap_fraction'].detach().float().item()
+                            z_mean = env_terms[f'{region}_z_mean'].detach().float().item()
+                            z_max = env_terms[f'{region}_z_max'].detach().float().item()
+                            rms_mean = env_terms[f'{region}_rms_mean'].detach().float().item()
+                            rms_max = env_terms[f'{region}_rms_max'].detach().float().item()
+
+                            env_log_parts.append(
+                                f'{region}: '
+                                f'loss={region_loss:.6f}, '
+                                f'weighted={weighted:.6f}, '
+                                f'active={active_fraction:.4f}, '
+                                f'over_cap={over_cap_fraction:.4f}, '
+                                f'valid={valid_fraction:.4f}, '
+                                f'rms_mean={rms_mean:.6f}, '
+                                f'rms_max={rms_max:.6f}, '
+                                f'z_mean={z_mean:.4f}, '
+                                f'z_max={z_max:.4f}'
+                            )
+
+                        logger.info(
+                            f'[WaveEnv step={global_step}] ' + ' | '.join(env_log_parts)
+                        )
+
+                if (
+                    wave is not None
+                    and (
+                        global_step == 1
+                        or (
+                            args.wave_log_every > 0
+                            and global_step % args.wave_log_every == 0
+                        )
+                    )
+                ):
                     raw = unwrap_model(wave)
                     logs.update({f'wave_rms/rms_{i}': float(v) for i, v in enumerate(raw.band_rms)})
                     logs['wave_rms/rms_updates'] = int(raw.rms_updates)
@@ -1767,6 +1828,7 @@ def main(args):
                                 f'wave_gate/gate_t{t}_b{b}_s{s}': float(gates[b, s])
                                 for b in range(4) for s in range(4)
                             })
+
                 accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:

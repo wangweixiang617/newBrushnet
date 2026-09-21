@@ -246,6 +246,7 @@ class WaveResidualEnvelopeLoss(nn.Module):
         z_sum = first.new_zeros((), dtype=torch.float32)
         rms_sum = first.new_zeros((), dtype=torch.float32)
         z_max = first.new_zeros((), dtype=torch.float32)
+        rms_max = first.new_zeros((), dtype=torch.float32)
 
         caps = getattr(self, f"{region}_caps")
         slot_weights = getattr(self, f"{region}_slot_weights")
@@ -281,6 +282,7 @@ class WaveResidualEnvelopeLoss(nn.Module):
             rms_sum = rms_sum + (rms * valid_f).sum()
             if bool(valid.any()):
                 z_max = torch.maximum(z_max, z.masked_fill(~valid, 0).max())
+                rms_max = torch.maximum(rms_max, rms.masked_fill(~valid, 0).max())
 
         loss = numerator / denominator.clamp_min(self.eps)
         count = valid_count.clamp_min(1.0)
@@ -292,6 +294,7 @@ class WaveResidualEnvelopeLoss(nn.Module):
             "z_mean": z_sum / count,
             "z_max": z_max,
             "rms_mean": rms_sum / count,
+            "rms_max": rms_max,
         }
         return loss, stats
 
