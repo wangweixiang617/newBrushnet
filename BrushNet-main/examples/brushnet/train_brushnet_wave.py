@@ -186,7 +186,9 @@ def log_validation_evaluator(
             # 后续 batch 直接传 None
             batch_trace = [] if (not trace_saved and wave is not None) else None
             with torch.no_grad(), accelerator.autocast(), wave_inference(
-                brushnet, wave, batch_conditioning_images, batch_mask_images, trace=batch_trace, unet=pipeline.unet
+                brushnet, wave, batch_conditioning_images, batch_mask_images,
+                trace=batch_trace, unet=pipeline.unet,
+                region_min_fraction=args.wave_env_min_region_fraction,
             ):
                 batch_result = pipeline(
                     batch_prompts,
@@ -1803,10 +1805,20 @@ def main(args):
                                 f'z_mean={z_mean:.4f}, '
                                 f'z_max={z_max:.4f}'
                             )
-
+                        metric_string = " | ".join(env_log_parts)
+                        # 1. logger / console
                         logger.info(
-                            f'[WaveEnv step={global_step}] ' + ' | '.join(env_log_parts)
+                            f'[WaveEnv step={global_step}] ' + metric_string
                         )
+                        # 2. file
+                        metrics_file = Path(args.output_dir) / "wave_env_metrics.txt"
+                        timestamp = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+                        with metrics_file.open("a", encoding="utf-8") as f:
+                            f.write(
+                                f"{timestamp} - "
+                                f"WaveEnv metrics at step {global_step}: "
+                                f"{metric_string}\n"
+                            )
 
                 if (
                     wave is not None

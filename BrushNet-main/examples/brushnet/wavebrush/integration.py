@@ -168,7 +168,7 @@ def image_tensors(images, masks, device, size=None):
 
 
 @contextmanager
-def wave_inference(brushnet,wave,images,masks,trace=None,unet=None):
+def wave_inference(brushnet,wave,images,masks,trace=None,unet=None,region_min_fraction=0.02):
     """One pipeline call, num_images_per_prompt=1; standard CFG [uncond batch, cond batch].
     Single BrushNet only. guess_mode/global_pool_conditions are deliberately rejected.
     Restores hook and training mode even when inference raises an exception.
@@ -184,6 +184,8 @@ def wave_inference(brushnet,wave,images,masks,trace=None,unet=None):
     wave.eval()
     if len(images) != len(masks):
         raise ValueError('Image/mask batch differs')
+    if not 0 <= float(region_min_fraction) < 1:
+        raise ValueError('region_min_fraction must satisfy 0 <= value < 1')
     x,m=image_tensors(images,masks,device)
     input_stats = None
     if trace is not None:
@@ -240,7 +242,10 @@ def wave_inference(brushnet,wave,images,masks,trace=None,unet=None):
                 gate_tensor=wave.effective_gates(torch.as_tensor(t,device=device).reshape(-1)).detach().float().cpu()
             gates = gate_tensor.numpy().round(8).tolist()
 
-            residual_rows = residual_stats(base, extra)
+            trace_hole = m if n == batch else m.repeat(2,1,1,1)
+            residual_rows = residual_stats(
+                base, extra, hole=trace_hole, min_region_fraction=region_min_fraction
+            )
             projected_branch_rms = wave.branch_rms(cached, t)
             trace_row = dict(
                 call=calls[0],
@@ -251,6 +256,7 @@ def wave_inference(brushnet,wave,images,masks,trace=None,unet=None):
                 residual_summary=residual_summary(residual_rows),
                 branch_rms=projected_branch_rms,
                 branch_summary=branch_summary(projected_branch_rms),
+                region_min_fraction=float(region_min_fraction),
             )
             if calls[0] == 0:
                 trace_row['wave_input'] = input_stats
@@ -274,11 +280,41 @@ def wave_inference(brushnet,wave,images,masks,trace=None,unet=None):
 
 
 @torch.no_grad()
-def residual_stats(base,extra):
+def _masked_rms_samples(residual, region_mask, min_region_fraction=0.02, eps=1e-8):
+    """Match WaveResidualEnvelopeLoss._masked_rms() exactly for trace collection."""
+    x = residual.detach().float()
+    m = torch.nn.functional.interpolate(
+        region_mask.detach().float(), size=x.shape[-2:], mode='area'
+    ).clamp_(0, 1)
+    coverage = m.mean(dim=(1, 2, 3))
+    valid = coverage >= float(min_region_fraction)
+    numerator = (x.square() * m).sum(dim=(1, 2, 3))
+    denominator = x.shape[1] * m.sum(dim=(1, 2, 3))
+    rms = torch.sqrt(numerator / denominator.clamp_min(eps) + eps)
+    values = [float(v) if bool(ok) else None for v, ok in zip(rms.cpu(), valid.cpu())]
+    return values, valid, coverage
+
+
+def _mean_valid(values):
+    valid = [v for v in values if v is not None]
+    return float(sum(valid) / len(valid)) if valid else None
+
+
+@torch.no_grad()
+def residual_stats(base,extra,hole=None,min_region_fraction=0.02):
     rows=[]
+    if hole is not None:
+        if hole.ndim != 4 or hole.shape[1] != 1:
+            raise ValueError(f'Expected hole mask [B,1,H,W], got {tuple(hole.shape)}')
+        if extra and hole.shape[0] != extra[0].shape[0]:
+            raise ValueError(
+                f'Trace hole batch {hole.shape[0]} differs from residual batch {extra[0].shape[0]}'
+            )
+
     for i,(b,w) in enumerate(zip(base,extra)):
         bf,wf=b.detach().float(),w.detach().float()
         br,wr=bf.square().mean().sqrt().item(),wf.square().mean().sqrt().item()
+        wave_rms_samples = wf.square().mean(dim=(1, 2, 3)).sqrt().cpu().tolist()
         cross = (bf * wf).mean().item()
         cosine = torch.nn.functional.cosine_similarity(
             bf.reshape(1, -1),
@@ -286,11 +322,32 @@ def residual_stats(base,extra):
         ).item()
         merged = bf + wf
         merged_rms = merged.square().mean().sqrt().item()
+
+        region_fields = {}
+        if hole is not None:
+            known_values, known_valid, known_coverage = _masked_rms_samples(
+                wf, 1.0 - hole, min_region_fraction=min_region_fraction
+            )
+            hole_values, hole_valid, hole_coverage = _masked_rms_samples(
+                wf, hole, min_region_fraction=min_region_fraction
+            )
+            region_fields = dict(
+                known_rms_samples=known_values,
+                hole_rms_samples=hole_values,
+                known_rms=_mean_valid(known_values),
+                hole_rms=_mean_valid(hole_values),
+                known_valid_fraction=float(known_valid.float().mean()),
+                hole_valid_fraction=float(hole_valid.float().mean()),
+                known_coverage_mean=float(known_coverage.mean()),
+                hole_coverage_mean=float(hole_coverage.mean()),
+            )
+
         rows.append(dict(
             slot=i,
             shape=list(b.shape),
             brush_rms=br,
             wave_rms=wr,
+            wave_rms_samples=[float(v) for v in wave_rms_samples],
             wave_mean=wf.mean().item(),
             wave_abs_max=wf.abs().max().item(),
             ratio=wr/max(br,1e-8),
@@ -298,6 +355,7 @@ def residual_stats(base,extra):
             cosine=cosine,
             merged_rms=merged_rms,
             merged_over_brush=merged_rms/max(br,1e-8),
+            **region_fields,
         ))
     return rows
 
