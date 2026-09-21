@@ -1202,6 +1202,15 @@ def main(args):
     # Register both BrushNet and wave for the original Accelerator checkpoint flow.
     register_model_hooks(accelerator)
     wave = build_wave(brushnet, args, accelerator.device, noise_scheduler.config.num_train_timesteps, unet=unet)
+    if wave is not None:
+        logger.info(
+            "Wave injection topology: mode=%s, active_slots=%d/%d, indices=%s",
+            wave.config.get('inject_mode', 'all'),
+            len(wave.active_slot_indices),
+            len(wave.spec['slots']),
+            list(wave.active_slot_indices),
+            main_process_only=True,
+        )
     wave_env = build_wave_residual_envelope(
         args, wave, noise_scheduler.config.num_train_timesteps, accelerator.device
     )

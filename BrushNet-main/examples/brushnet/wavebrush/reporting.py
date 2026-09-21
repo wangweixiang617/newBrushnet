@@ -10,7 +10,19 @@ def parameter_report(wave, brushnet=None):
         out.update(adapters=count(wave.adapters), projections=count(wave.projections), gates=count(wave.gates), zero_convs=count(wave.zero))
         out['adapter_each'] = [count(m) for m in wave.adapters]
         out['config'] = wave.config
-        out['slots'] = [dict(slot=i, **s, parameters=count(m)) for i, (s, m) in enumerate(zip(wave.spec['slots'], wave.zero))]
+        active = list(getattr(wave, 'active_slot_indices', range(len(wave.spec['slots']))))
+        layer_by_slot = {slot: layer for slot, layer in zip(active, wave.zero)}
+        out['active_slot_indices'] = active
+        out['inactive_slot_indices'] = [i for i in range(len(wave.spec['slots'])) if i not in layer_by_slot]
+        out['slots'] = [
+            dict(
+                slot=i,
+                active=i in layer_by_slot,
+                **slot_spec,
+                parameters=count(layer_by_slot.get(i)),
+            )
+            for i, slot_spec in enumerate(wave.spec['slots'])
+        ]
         out['wave_to_brushnet_percent'] = 100 * out['wave'] / out['brushnet'] if out['brushnet'] else None
     return out
 

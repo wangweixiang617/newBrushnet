@@ -11,6 +11,7 @@ All public masks use 1=hole, matching wavebrush.core.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
@@ -82,6 +83,7 @@ def _cap_table(
     num_bins: int,
     num_train_timesteps: int,
     device,
+    active_slot_indices=None,
 ) -> Optional[torch.Tensor]:
     # A region-specific fixed C intentionally overrides the JSON table for that region.
     if fixed_c is not None:
@@ -109,14 +111,33 @@ def _cap_table(
     table = caps.get(region) if isinstance(caps, dict) else None
     if table is None:
         return None
-    table = torch.as_tensor(table, dtype=torch.float32, device=device)
-    if table.shape != (num_slots, num_bins):
-        raise ValueError(
-            f"Cap table '{region}' must have shape [{num_slots},{num_bins}], got {tuple(table.shape)}"
-        )
-    if not torch.isfinite(table).all() or (table <= 0).any():
-        raise ValueError(f"Cap table '{region}' must contain finite positive values")
-    return table
+    # Keep cap files on the public BrushNet slot schema (normally 28 rows).
+    # Inactive topology rows are never used by the loss. To make future
+    # Down+Mid cap builders robust, None/0/non-finite placeholders are accepted
+    # only on inactive rows and replaced by 1.0 internally.
+    if not isinstance(table, (list, tuple)) or len(table) != num_slots:
+        raise ValueError(f"Cap table '{region}' must contain {num_slots} slot rows")
+    active = set(range(num_slots) if active_slot_indices is None else map(int, active_slot_indices))
+    cleaned = []
+    for i, row in enumerate(table):
+        if not isinstance(row, (list, tuple)) or len(row) != num_bins:
+            raise ValueError(f"Cap table '{region}' row {i} must have {num_bins} bins")
+        cleaned_row = []
+        for value in row:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = float('nan')
+            if i in active:
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(
+                        f"Cap table '{region}' active slot {i} must contain finite positive values"
+                    )
+                cleaned_row.append(value)
+            else:
+                cleaned_row.append(value if math.isfinite(value) and value > 0 else 1.0)
+        cleaned.append(cleaned_row)
+    return torch.tensor(cleaned, dtype=torch.float32, device=device)
 
 
 class WaveResidualEnvelopeLoss(nn.Module):
@@ -150,6 +171,7 @@ class WaveResidualEnvelopeLoss(nn.Module):
         global_slot_weights: Optional[torch.Tensor] = None,
         known_slot_weights: Optional[torch.Tensor] = None,
         hole_slot_weights: Optional[torch.Tensor] = None,
+        active_slot_indices=None,
         min_region_fraction: float = 0.02,
         eps: float = 1e-8,
     ):
@@ -162,6 +184,18 @@ class WaveResidualEnvelopeLoss(nn.Module):
             raise ValueError("eps must be positive")
 
         self.num_slots = int(num_slots)
+        if active_slot_indices is None:
+            active_slot_indices = list(range(self.num_slots))
+        active_slot_indices = tuple(int(i) for i in active_slot_indices)
+        if not active_slot_indices:
+            raise ValueError('Residual envelope requires at least one active Wave slot')
+        if len(set(active_slot_indices)) != len(active_slot_indices):
+            raise ValueError('active_slot_indices must not contain duplicates')
+        if min(active_slot_indices) < 0 or max(active_slot_indices) >= self.num_slots:
+            raise ValueError('active_slot_indices contains an out-of-range residual slot')
+        self.active_slot_indices = active_slot_indices
+        self.active_slot_set = set(active_slot_indices)
+        self.num_active_slots = len(active_slot_indices)
         self.num_train_timesteps = int(num_train_timesteps)
         self.num_bins = int(num_bins)
         self.min_region_fraction = float(min_region_fraction)
@@ -237,7 +271,7 @@ class WaveResidualEnvelopeLoss(nn.Module):
         return rms, valid
 
     def _region_loss(self, region: str, residuals, hole: torch.Tensor, bins: torch.Tensor):
-        first = residuals[0]
+        first = residuals[self.active_slot_indices[0]]
         numerator = first.float().sum() * 0.0
         denominator = first.new_zeros((), dtype=torch.float32)
         valid_count = first.new_zeros((), dtype=torch.float32)
@@ -257,7 +291,8 @@ class WaveResidualEnvelopeLoss(nn.Module):
         elif region == "hole":
             region_mask = hole.float()
 
-        for i, residual in enumerate(residuals):
+        for i in self.active_slot_indices:
+            residual = residuals[i]
             if residual.shape[0] != bins.shape[0]:
                 raise ValueError(
                     f"Residual batch {residual.shape[0]} differs from timestep batch {bins.shape[0]} at slot {i}"
@@ -288,7 +323,7 @@ class WaveResidualEnvelopeLoss(nn.Module):
         count = valid_count.clamp_min(1.0)
         stats = {
             "loss": loss,
-            "valid_fraction": valid_count / float(bins.shape[0] * self.num_slots),
+            "valid_fraction": valid_count / float(bins.shape[0] * self.num_active_slots),
             "active_fraction": active_count / count,
             "over_cap_fraction": over_cap_count / count,
             "z_mean": z_sum / count,
@@ -311,7 +346,7 @@ class WaveResidualEnvelopeLoss(nn.Module):
             raise ValueError(f"Timestep batch {t.numel()} differs from residual batch {batch}")
         bins = self.timestep_bins(t).to(residuals[0].device)
 
-        total = residuals[0].float().sum() * 0.0
+        total = residuals[self.active_slot_indices[0]].float().sum() * 0.0
         output: Dict[str, torch.Tensor] = {"total": total}
         for region in REGIONS:
             weight = self.region_weights[region]
@@ -328,6 +363,8 @@ class WaveResidualEnvelopeLoss(nn.Module):
     def export_config(self) -> dict:
         out = {
             "num_slots": self.num_slots,
+            "num_active_slots": self.num_active_slots,
+            "active_slot_indices": list(self.active_slot_indices),
             "num_bins": self.num_bins,
             "num_train_timesteps": self.num_train_timesteps,
             "min_region_fraction": self.min_region_fraction,
@@ -359,6 +396,7 @@ def build_wave_residual_envelope(args, wave, num_train_timesteps: int, device):
         raise ValueError("Residual-envelope regularization requires WaveConditioner")
 
     num_slots = len(wave.spec["slots"])
+    active_slot_indices = list(getattr(wave, 'active_slot_indices', range(num_slots)))
     num_bins = int(args.wave_env_bins)
     cap_file = _load_cap_file(args.wave_env_caps_json)
 
@@ -373,6 +411,7 @@ def build_wave_residual_envelope(args, wave, num_train_timesteps: int, device):
             num_bins,
             num_train_timesteps,
             device,
+            active_slot_indices=active_slot_indices,
         )
         slot_weights[region] = _as_slot_weights(
             getattr(args, f"wave_env_{region}_slot_weights"), num_slots, device
@@ -394,5 +433,6 @@ def build_wave_residual_envelope(args, wave, num_train_timesteps: int, device):
         global_slot_weights=slot_weights["global"],
         known_slot_weights=slot_weights["known"],
         hole_slot_weights=slot_weights["hole"],
+        active_slot_indices=active_slot_indices,
         min_region_fraction=float(args.wave_env_min_region_fraction),
     ).to(device)

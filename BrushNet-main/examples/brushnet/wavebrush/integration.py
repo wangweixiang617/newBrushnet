@@ -18,6 +18,8 @@ def add_wave_args(parser):
     parser.add_argument('--wave_resume', type=str, help='Warm-start wave folder; not optimizer resume')
     parser.add_argument('--wave_widths', type=int, nargs=4, default=[32,64,96,128])
     parser.add_argument('--wave_adapter', choices=['legacy','unet','selfattn','hybrid','crossattn'], default='unet')
+    parser.add_argument('--wave_inject_mode', choices=['all','down_mid','down'], default='all',
+                        help='Wave residual topology: all=down+mid+up, down_mid=down+mid only, down=down only')
     parser.add_argument('--wave_use_sd_temb', action='store_true',
                         help='Use frozen SD UNet timestep embedding inside Wave UNet/selfattn/hybrid adapters')
     parser.add_argument('--wave_gate', choices=['fixed','constant','time'])
@@ -122,6 +124,12 @@ def build_wave(brushnet, args, device, timesteps=1000, unet=None):
             raise ValueError('Saved wave residual schema differs from current BrushNet')
         if wave.config.get('temb_channels') != temb_channels:
             raise ValueError('Wave warm-start temporal configuration differs; use a matching wave or start fresh')
+        saved_inject_mode = wave.config.get('inject_mode', 'all')
+        if saved_inject_mode != args.wave_inject_mode:
+            raise ValueError(
+                f'Wave warm-start inject_mode={saved_inject_mode} differs from requested '
+                f'{args.wave_inject_mode}; topology changes require a fresh/matching Wave checkpoint'
+            )
     else:
         options = dict(PRESETS[args.wave_preset])
         if args.wave_gate:
@@ -132,7 +140,7 @@ def build_wave(brushnet, args, device, timesteps=1000, unet=None):
                                gate_max=args.wave_gate_max,gate_init=args.wave_gate_init,timesteps=timesteps,
                                soft_lambda=args.wave_soft_lambda,shared=args.wave_shared,coarse_only=args.wave_coarse_only,
                                adapter_type=args.wave_adapter,cross_attention_dim=cross_dim,cross_attention_heads=8,
-                               temb_channels=temb_channels).to(device)
+                               temb_channels=temb_channels, inject_mode=args.wave_inject_mode).to(device)
         if options['transform'] != 'rgb' and args.wave_rms:
             data = json.loads(Path(args.wave_rms).read_text())
             if data.get('resolution') != args.resolution:
@@ -244,7 +252,8 @@ def wave_inference(brushnet,wave,images,masks,trace=None,unet=None,region_min_fr
 
             trace_hole = m if n == batch else m.repeat(2,1,1,1)
             residual_rows = residual_stats(
-                base, extra, hole=trace_hole, min_region_fraction=region_min_fraction
+                base, extra, hole=trace_hole, min_region_fraction=region_min_fraction,
+                active_slot_indices=wave.active_slot_indices,
             )
             projected_branch_rms = wave.branch_rms(cached, t)
             trace_row = dict(
@@ -255,7 +264,9 @@ def wave_inference(brushnet,wave,images,masks,trace=None,unet=None,region_min_fr
                 residuals=residual_rows,
                 residual_summary=residual_summary(residual_rows),
                 branch_rms=projected_branch_rms,
-                branch_summary=branch_summary(projected_branch_rms),
+                branch_summary=branch_summary(projected_branch_rms, wave.active_slot_indices),
+                inject_mode=wave.config.get('inject_mode', 'all'),
+                active_slot_indices=list(wave.active_slot_indices),
                 region_min_fraction=float(region_min_fraction),
             )
             if calls[0] == 0:
@@ -301,8 +312,9 @@ def _mean_valid(values):
 
 
 @torch.no_grad()
-def residual_stats(base,extra,hole=None,min_region_fraction=0.02):
+def residual_stats(base,extra,hole=None,min_region_fraction=0.02,active_slot_indices=None):
     rows=[]
+    active_set = None if active_slot_indices is None else {int(i) for i in active_slot_indices}
     if hole is not None:
         if hole.ndim != 4 or hole.shape[1] != 1:
             raise ValueError(f'Expected hole mask [B,1,H,W], got {tuple(hole.shape)}')
@@ -344,6 +356,7 @@ def residual_stats(base,extra,hole=None,min_region_fraction=0.02):
 
         rows.append(dict(
             slot=i,
+            wave_active=True if active_set is None else i in active_set,
             shape=list(b.shape),
             brush_rms=br,
             wave_rms=wr,
@@ -362,13 +375,23 @@ def residual_stats(base,extra,hole=None,min_region_fraction=0.02):
 
 @torch.no_grad()
 def residual_summary(rows):
-    """Compact residual diagnostics for one diffusion timestep."""
+    """Compact residual diagnostics for one diffusion timestep.
+
+    If rows carry wave_active flags, summary statistics use only active Wave
+    injection slots so intentionally-zero Up slots do not dilute the metrics.
+    Raw residual rows still keep the full BrushNet slot schema.
+    """
     if not rows:
         return {}
-    ratios = torch.tensor([r['ratio'] for r in rows], dtype=torch.float32)
-    cosines = torch.tensor([r['cosine'] for r in rows], dtype=torch.float32)
-    merged_ratios = torch.tensor([r['merged_over_brush'] for r in rows], dtype=torch.float32)
+    active_rows = [r for r in rows if r.get('wave_active', True)]
+    if not active_rows:
+        return {'num_slots': len(rows), 'num_active_slots': 0}
+    ratios = torch.tensor([r['ratio'] for r in active_rows], dtype=torch.float32)
+    cosines = torch.tensor([r['cosine'] for r in active_rows], dtype=torch.float32)
+    merged_ratios = torch.tensor([r['merged_over_brush'] for r in active_rows], dtype=torch.float32)
     return {
+        'num_slots': len(rows),
+        'num_active_slots': len(active_rows),
         'ratio_mean': float(ratios.mean()),
         'ratio_median': float(ratios.median()),
         'ratio_p90': float(torch.quantile(ratios, 0.90)),
@@ -398,6 +421,8 @@ def wave_input_stats(wave, image, hole):
         'drop_interval': cfg.get('drop_interval'),
         'gate_override': cfg.get('gate_override'),
         'wave_strength': cfg.get('wave_strength', 1.0),
+        'inject_mode': cfg.get('inject_mode', 'all'),
+        'active_slot_indices': list(wave.active_slot_indices),
         'rms_fitted': bool(wave.rms_fitted.item()),
         'rms_updates': int(wave.rms_updates.item()),
         'band_rms_buffer': [float(v) for v in wave.band_rms.detach().float().cpu()],
@@ -488,20 +513,33 @@ def feature_rms_stats(features):
 
 
 @torch.no_grad()
-def branch_summary(branch_values):
-    """Summarize projected per-band RMS. normalized_proxy is descriptive, not additive energy."""
+def branch_summary(branch_values, active_slot_indices=None):
+    """Summarize projected per-band RMS over active Wave slots only.
+
+    branch_values keeps the full public slot layout; inactive rows are zeros.
+    normalized_proxy is descriptive, not additive energy.
+    """
     if not branch_values:
         return {}
     x = torch.tensor(branch_values, dtype=torch.float32)
+    if active_slot_indices is not None:
+        indices = torch.as_tensor(list(active_slot_indices), dtype=torch.long)
+        if indices.numel() == 0:
+            return {'num_slots': int(x.shape[0]), 'num_active_slots': 0}
+        x_active = x.index_select(0, indices)
+    else:
+        x_active = x
     result = {
+        'num_slots': int(x.shape[0]),
+        'num_active_slots': int(x_active.shape[0]),
         'slot_mean_rms': {
-            name: float(x[:, b].mean()) for b, name in enumerate(BANDS)
+            name: float(x_active[:, b].mean()) for b, name in enumerate(BANDS)
         },
         'slot_max_rms': {
-            name: float(x[:, b].max()) for b, name in enumerate(BANDS)
+            name: float(x_active[:, b].max()) for b, name in enumerate(BANDS)
         },
     }
-    proxy = x.mean(dim=0)
+    proxy = x_active.mean(dim=0)
     total = proxy.sum()
     if float(total) > 0:
         proxy = proxy / total

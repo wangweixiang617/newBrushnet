@@ -503,7 +503,7 @@ class WaveConditioner(nn.Module):
                  widths=(32,64,96,128), gate_max=1., gate_init=.5, timesteps=1000, soft_lambda=.5,
                  shared=False, coarse_only=False, adapter_type='legacy', cross_attention_dim=768,
                  cross_attention_heads=8, drop_bands=None, drop_scales=None, drop_interval=None,
-                 gate_override=None, wave_strength=1., temb_channels=None):
+                 gate_override=None, wave_strength=1., temb_channels=None, inject_mode='all'):
         super().__init__()
         if reliability not in ('none', 'concat', 'premul', 'soft'):
             raise ValueError('Unknown reliability mode')
@@ -511,6 +511,8 @@ class WaveConditioner(nn.Module):
             raise ValueError('Unknown transform')
         if adapter_type not in ('legacy', 'unet', 'selfattn', 'hybrid', 'crossattn'):
             raise ValueError('Unknown adapter type')
+        if inject_mode not in ('all', 'down_mid', 'down'):
+            raise ValueError("inject_mode must be one of: all, down_mid, down")
         if not 0 <= soft_lambda <= 1 or len(widths) != 4 or min(widths) < 1:
             raise ValueError('Invalid soft_lambda/adapter widths')
         if adapter_type == 'selfattn' and shared:
@@ -527,8 +529,26 @@ class WaveConditioner(nn.Module):
                            widths=list(widths), gate_max=gate_max, gate_init=gate_init, timesteps=timesteps,
                            soft_lambda=soft_lambda, shared=shared, coarse_only=coarse_only, adapter_type=adapter_type,
                            cross_attention_dim=cross_attention_dim, cross_attention_heads=cross_attention_heads,
-                           temb_channels=temb_channels)
+                           temb_channels=temb_channels, inject_mode=inject_mode)
         self.spec = spec
+        total_slots = len(spec['slots'])
+        n_down = int(spec['n_down'])
+        n_up = int(spec['n_up'])
+        if n_down + 1 + n_up != total_slots:
+            raise ValueError(
+                f"Residual schema is inconsistent: n_down={n_down}, n_up={n_up}, total={total_slots}"
+            )
+        if inject_mode == 'all':
+            active = list(range(total_slots))
+        elif inject_mode == 'down_mid':
+            active = list(range(n_down + 1))
+        else:  # down
+            active = list(range(n_down))
+        if not active:
+            raise ValueError('Wave injection mode produced no active residual slots')
+        self.active_slot_indices = tuple(active)
+        self.active_slot_set = set(active)
+        self.inactive_slot_indices = tuple(i for i in range(total_slots) if i not in self.active_slot_set)
         # Non-gradient RMS buffers; EMA updates occur only after successful optimizer steps.
         self.register_buffer('band_rms', torch.ones(10))
         self.register_buffer('rms_fitted', torch.tensor(False))
@@ -554,7 +574,13 @@ class WaveConditioner(nn.Module):
             self.projections = nn.ModuleList()
             self.adapters = nn.ModuleList(make_adapter(c) for c in in_channels)
         self.gates = Gates(gate, gate_max, gate_init, timesteps)
-        self.zero = nn.ModuleList(nn.Conv2d(4*widths[s['scale']], s['channels'], 1, bias=False) for s in spec['slots'])
+        # Scheme B: only active residual slots own learned ZeroConv heads. Inactive
+        # slots are represented by exact zero tensors in project(), so merge_residuals
+        # keeps the public BrushNet 28-slot schema unchanged.
+        self.zero = nn.ModuleList(
+            nn.Conv2d(4 * widths[spec['slots'][i]['scale']], spec['slots'][i]['channels'], 1, bias=False)
+            for i in self.active_slot_indices
+        )
         for layer in self.zero:
             nn.init.zeros_(layer.weight)
         # Runtime interventions contain no learned parameters, but are persisted in config.json
@@ -726,28 +752,50 @@ class WaveConditioner(nn.Module):
         if len(t) != batch:
             raise ValueError('Timestep batch mismatch')
         g = self.effective_gates(t)
-        fused = [torch.cat([features[b][s]*g[:,b,s,None,None,None].to(features[b][s].dtype) for b in range(4)],1) for s in range(4)]
-        return [self.strength*layer(fused[slot['scale']]) for layer,slot in zip(self.zero,self.spec['slots'])]
+        fused = [
+            torch.cat([features[b][s] * g[:, b, s, None, None, None].to(features[b][s].dtype) for b in range(4)], 1,)
+            for s in range(4)
+        ]
+        # Keep the external residual contract identical to BrushNet: always return
+        # one tensor per residual slot. Only active slots have learned ZeroConv
+        # heads; inactive slots are exact zeros and therefore cannot receive or
+        # backpropagate a learned Wave injection.
+        layer_by_slot = dict(zip(self.active_slot_indices, self.zero))
+        outputs = []
+        for i, slot in enumerate(self.spec['slots']):
+            scale = slot['scale']
+            x = fused[scale]
+            layer = layer_by_slot.get(i)
+            if layer is None:
+                outputs.append(x.new_zeros((batch, slot['channels'], x.shape[-2], x.shape[-1])))
+            else:
+                outputs.append(self.strength * layer(x))
+        return outputs
 
     @torch.no_grad()
     def branch_rms(self, features, timesteps):
-        """Actual projected per-band contribution; sums reconstruct the full wave residual."""
+        """Actual projected per-band contribution for all public residual slots.
+
+        Inactive slots are retained as [0,0,0,0] rows so old 28-slot analysis
+        code can still align traces by slot index.
+        """
         batch = features[0][0].shape[0]
         t = torch.as_tensor(timesteps, device=features[0][0].device).reshape(-1)
         if t.numel() == 1:
             t = t.expand(batch)
         g = self.effective_gates(t)
-        rows = []
-        for layer, slot in zip(self.zero, self.spec['slots']):
+        rows = [[0.0, 0.0, 0.0, 0.0] for _ in self.spec['slots']]
+        for slot_index, layer in zip(self.active_slot_indices, self.zero):
+            slot = self.spec['slots'][slot_index]
             scale = slot['scale']
             width = features[0][scale].shape[1]
             values = []
             for b in range(4):
-                x = features[b][scale]*g[:,b,scale,None,None,None].to(features[b][scale].dtype)
-                weight = layer.weight[:,b*width:(b+1)*width]
-                z = self.strength*F.conv2d(x,weight)
+                x = features[b][scale] * g[:, b, scale, None, None, None].to(features[b][scale].dtype)
+                weight = layer.weight[:, b * width:(b + 1) * width]
+                z = self.strength * F.conv2d(x, weight)
                 values.append(float(z.float().square().mean().sqrt()))
-            rows.append(values)
+            rows[slot_index] = values
         return rows
 
     def forward(self, image, hole, timesteps, encoder_hidden_states=None, temb=None):
