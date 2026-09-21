@@ -48,6 +48,7 @@ from wavebrush.integration import add_wave_args, build_wave, wave_inference, sd_
 from wavebrush.core import merge_residuals
 from wavebrush.rms import RMSAccumulator, initialize_rms_from_loader
 from wavebrush.runtime import register_model_hooks, validation_guard
+from wavebrush.residual_envelope import build_wave_residual_envelope
 
 if is_wandb_available():
     import wandb
@@ -1199,6 +1200,9 @@ def main(args):
     # Register both BrushNet and wave for the original Accelerator checkpoint flow.
     register_model_hooks(accelerator)
     wave = build_wave(brushnet, args, accelerator.device, noise_scheduler.config.num_train_timesteps, unet=unet)
+    wave_env = build_wave_residual_envelope(
+        args, wave, noise_scheduler.config.num_train_timesteps, accelerator.device
+    )
     brushnet.requires_grad_(args.train_brushnet)
     rms_accumulator = RMSAccumulator(accelerator.device, args.rms_mode, args.rms_ema_decay)
 
@@ -1403,6 +1407,10 @@ def main(args):
         report.update(world_size=accelerator.num_processes, effective_batch=args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps)
         Path(args.output_dir, 'parameter_report.json').write_text(json.dumps(report, indent=2))
         Path(args.output_dir, 'run_config.json').write_text(json.dumps(tracker_config, indent=2))
+        if wave_env is not None:
+            Path(args.output_dir, 'wave_env_config.json').write_text(
+                json.dumps(wave_env.export_config(), indent=2), encoding='utf-8'
+            )
 
     #添加多线模式
     T = noise_scheduler.config.num_train_timesteps
@@ -1606,6 +1614,7 @@ def main(args):
                     return_dict=False,
                 )
 
+                env_terms = None
                 if wave is not None:
                     wave_temb = None
                     if args.wave_use_sd_temb:
@@ -1642,7 +1651,11 @@ def main(args):
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                diff_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                loss = diff_loss
+                if wave_env is not None:
+                    env_terms = wave_env(extra, 1-batch['masks'], timesteps)
+                    loss = loss + env_terms['total']
 
                 accelerator.backward(loss)
 
@@ -1731,7 +1744,7 @@ def main(args):
             # Basic training logs
             # --------------------------------------------------
             current_lrs = lr_scheduler.get_last_lr()
-            logs = {"loss": loss.detach().float().item(),}
+            logs = {"loss": loss.detach().float().item()}
             for name, lr in zip(optimizer_group_names, current_lrs):
                 logs[f"{name}_lr"] = lr
             # Progress bar
@@ -1739,6 +1752,10 @@ def main(args):
 
             # TensorBoard
             if accelerator.sync_gradients:
+                logs['diff_loss'] = diff_loss.detach().float().item()
+                if env_terms is not None:
+                    for key, value in env_terms.items():
+                        logs[f'wave_env/{key}'] = value.detach().float().item()
                 if (wave is not None and args.wave_log_every > 0 and global_step % args.wave_log_every == 0 or global_step == 1):
                     raw = unwrap_model(wave)
                     logs.update({f'wave_rms/rms_{i}': float(v) for i, v in enumerate(raw.band_rms)})

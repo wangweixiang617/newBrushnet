@@ -37,6 +37,28 @@ def add_wave_args(parser):
     parser.add_argument('--wave_strength', type=float, default=1.)
     parser.add_argument('--wave_log_every', type=int, default=10)
 
+    # Residual-envelope regularization. All three terms are independently switchable by weight.
+    # A region-specific fixed C overrides that region in --wave_env_caps_json.
+    parser.add_argument('--wave_env_global_weight', type=float, default=0.0)
+    parser.add_argument('--wave_env_known_weight', type=float, default=0.0)
+    parser.add_argument('--wave_env_hole_weight', type=float, default=0.0)
+    parser.add_argument('--wave_env_global_beta', type=float, default=0.95)
+    parser.add_argument('--wave_env_known_beta', type=float, default=0.90)
+    parser.add_argument('--wave_env_hole_beta', type=float, default=1.00)
+    parser.add_argument('--wave_env_global_c', type=float, default=None,
+                        help='Fixed global C for every residual slot/timestep bin; overrides JSON global caps')
+    parser.add_argument('--wave_env_known_c', type=float, default=None,
+                        help='Fixed known-region C for every residual slot/timestep bin; overrides JSON known caps')
+    parser.add_argument('--wave_env_hole_c', type=float, default=None,
+                        help='Fixed hole-region C for every residual slot/timestep bin; overrides JSON hole caps')
+    parser.add_argument('--wave_env_caps_json', type=str, default=None,
+                        help='Optional fixed per-slot/per-timestep C tables for global/known/hole')
+    parser.add_argument('--wave_env_bins', type=int, default=5)
+    parser.add_argument('--wave_env_min_region_fraction', type=float, default=0.02)
+    parser.add_argument('--wave_env_global_slot_weights', type=float, nargs=28, default=None)
+    parser.add_argument('--wave_env_known_slot_weights', type=float, nargs=28, default=None)
+    parser.add_argument('--wave_env_hole_slot_weights', type=float, nargs=28, default=None)
+
 
 def sd_time_embed_dim(unet):
     """Dimension of the frozen SD UNet timestep embedding consumed by its ResNet blocks."""
