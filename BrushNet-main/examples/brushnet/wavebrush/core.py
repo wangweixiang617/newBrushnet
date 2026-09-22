@@ -101,6 +101,112 @@ def merge_residuals(base, additions, strength=1.):
     return list(out[:nd]), out[nd], list(out[nd+1:])
 
 
+INJECT_MODES = ('all', 'down_mid', 'down', 'stage_exit_mid', 'sparse5_custom')
+
+
+def _validate_residual_spec(spec):
+    if not isinstance(spec, dict) or 'slots' not in spec or 'n_down' not in spec or 'n_up' not in spec:
+        raise ValueError('Residual spec must contain slots, n_down and n_up')
+    slots = spec['slots']
+    total_slots = len(slots)
+    n_down = int(spec['n_down'])
+    n_up = int(spec['n_up'])
+    if n_down < 1 or n_up < 0 or n_down + 1 + n_up != total_slots:
+        raise ValueError(
+            f'Residual schema is inconsistent: n_down={n_down}, n_up={n_up}, total={total_slots}'
+        )
+    for i, slot in enumerate(slots):
+        if 'channels' not in slot or 'scale' not in slot:
+            raise ValueError(f'Residual slot {i} must contain channels and scale')
+        scale = int(slot['scale'])
+        if scale not in range(4):
+            raise ValueError(f'Residual slot {i} has unsupported scale {scale}; expected 0..3')
+    return total_slots, n_down, n_up
+
+
+def _down_slots_by_scale(spec):
+    _, n_down, _ = _validate_residual_spec(spec)
+    groups = {s: [] for s in range(4)}
+    for i in range(n_down):
+        groups[int(spec['slots'][i]['scale'])].append(i)
+    missing = [s for s, indices in groups.items() if not indices]
+    if missing:
+        raise ValueError(
+            f'Wave sparse5 topology requires one or more Down residual slots at every scale 0..3; missing {missing}'
+        )
+    return groups
+
+
+def resolve_active_slot_indices(spec, inject_mode='all', inject_down_slots=None):
+    """Resolve a user-facing injection mode into the single active-slot topology.
+
+    sparse5_custom is intentionally constrained: exactly one Down residual slot
+    must be chosen from each scale 0/1/2/3; Mid is appended automatically.
+    This prevents a custom CLI from silently re-introducing same-scale fan-out.
+    """
+    total_slots, n_down, _ = _validate_residual_spec(spec)
+    if inject_mode not in INJECT_MODES:
+        raise ValueError(f'inject_mode must be one of: {", ".join(INJECT_MODES)}')
+
+    if inject_mode != 'sparse5_custom' and inject_down_slots not in (None, [], ()):
+        raise ValueError('--wave_inject_down_slots is valid only with --wave_inject_mode sparse5_custom')
+
+    if inject_mode == 'all':
+        active = list(range(total_slots))
+    elif inject_mode == 'down_mid':
+        active = list(range(n_down + 1))
+    elif inject_mode == 'down':
+        active = list(range(n_down))
+    elif inject_mode == 'stage_exit_mid':
+        groups = _down_slots_by_scale(spec)
+        active = [groups[s][-1] for s in range(4)] + [n_down]
+    else:
+        if inject_down_slots is None:
+            raise ValueError(
+                '--wave_inject_mode sparse5_custom requires exactly four values in --wave_inject_down_slots'
+            )
+        try:
+            requested = [int(i) for i in inject_down_slots]
+        except (TypeError, ValueError) as exc:
+            raise ValueError('--wave_inject_down_slots must contain integer Down-slot indices') from exc
+        if len(requested) != 4:
+            raise ValueError('sparse5_custom requires exactly four Down slots: one for each scale 0,1,2,3')
+        if len(set(requested)) != 4:
+            raise ValueError('sparse5_custom Down slots must not contain duplicates')
+        bad = [i for i in requested if i < 0 or i >= n_down]
+        if bad:
+            raise ValueError(
+                f'sparse5_custom accepts Down slots only (0..{n_down - 1}); invalid indices: {bad}'
+            )
+        by_scale = {}
+        for i in requested:
+            scale = int(spec['slots'][i]['scale'])
+            if scale in by_scale:
+                raise ValueError(
+                    f'sparse5_custom selected more than one Down slot at scale {scale}: '
+                    f'{by_scale[scale]} and {i}'
+                )
+            by_scale[scale] = i
+        missing = [s for s in range(4) if s not in by_scale]
+        if missing:
+            raise ValueError(
+                f'sparse5_custom must select exactly one Down slot from every scale 0..3; missing scales {missing}'
+            )
+        # Canonical order follows Wave feature scales, independent of CLI order.
+        active = [by_scale[s] for s in range(4)] + [n_down]
+
+    if not active:
+        raise ValueError('Wave injection mode produced no active residual slots')
+    if len(set(active)) != len(active):
+        raise ValueError(f'Resolved Wave topology contains duplicate slots: {active}')
+    return tuple(active)
+
+
+def wave_topology_signature(inject_mode, active_slot_indices):
+    slots = '-'.join(str(int(i)) for i in active_slot_indices)
+    return f'{inject_mode}_{slots}'
+
+
 class Adapter(nn.Module):
     def __init__(self, channels, widths):
         super().__init__()
@@ -503,7 +609,8 @@ class WaveConditioner(nn.Module):
                  widths=(32,64,96,128), gate_max=1., gate_init=.5, timesteps=1000, soft_lambda=.5,
                  shared=False, coarse_only=False, adapter_type='legacy', cross_attention_dim=768,
                  cross_attention_heads=8, drop_bands=None, drop_scales=None, drop_interval=None,
-                 gate_override=None, wave_strength=1., temb_channels=None, inject_mode='all'):
+                 gate_override=None, wave_strength=1., temb_channels=None, inject_mode='all',
+                 inject_down_slots=None, active_slot_indices=None, topology_signature=None):
         super().__init__()
         if reliability not in ('none', 'concat', 'premul', 'soft'):
             raise ValueError('Unknown reliability mode')
@@ -511,8 +618,6 @@ class WaveConditioner(nn.Module):
             raise ValueError('Unknown transform')
         if adapter_type not in ('legacy', 'unet', 'selfattn', 'hybrid', 'crossattn'):
             raise ValueError('Unknown adapter type')
-        if inject_mode not in ('all', 'down_mid', 'down'):
-            raise ValueError("inject_mode must be one of: all, down_mid, down")
         if not 0 <= soft_lambda <= 1 or len(widths) != 4 or min(widths) < 1:
             raise ValueError('Invalid soft_lambda/adapter widths')
         if adapter_type == 'selfattn' and shared:
@@ -525,30 +630,34 @@ class WaveConditioner(nn.Module):
                 raise ValueError('temb_channels must be positive')
             if adapter_type not in ('unet', 'selfattn', 'hybrid'):
                 raise ValueError('SD timestep conditioning supports unet/selfattn/hybrid adapters only')
+        self.spec = spec
+        total_slots, n_down, _ = _validate_residual_spec(spec)
+        resolved_active = resolve_active_slot_indices(spec, inject_mode, inject_down_slots)
+        resolved_signature = wave_topology_signature(inject_mode, resolved_active)
+        if active_slot_indices is not None:
+            saved_active = tuple(int(i) for i in active_slot_indices)
+            if saved_active != resolved_active:
+                raise ValueError(
+                    f'Saved active_slot_indices={list(saved_active)} do not match topology resolved from '
+                    f'inject_mode={inject_mode}: {list(resolved_active)}'
+                )
+        if topology_signature is not None and str(topology_signature) != resolved_signature:
+            raise ValueError(
+                f'Saved topology_signature={topology_signature!r} does not match resolved {resolved_signature!r}'
+            )
+        resolved_down_slots = list(resolved_active[:-1]) if inject_mode == 'sparse5_custom' else None
         self.config = dict(spec=spec, transform=transform, reliability=reliability, gate=gate, support=support,
                            widths=list(widths), gate_max=gate_max, gate_init=gate_init, timesteps=timesteps,
                            soft_lambda=soft_lambda, shared=shared, coarse_only=coarse_only, adapter_type=adapter_type,
                            cross_attention_dim=cross_attention_dim, cross_attention_heads=cross_attention_heads,
-                           temb_channels=temb_channels, inject_mode=inject_mode)
-        self.spec = spec
-        total_slots = len(spec['slots'])
-        n_down = int(spec['n_down'])
-        n_up = int(spec['n_up'])
-        if n_down + 1 + n_up != total_slots:
-            raise ValueError(
-                f"Residual schema is inconsistent: n_down={n_down}, n_up={n_up}, total={total_slots}"
-            )
-        if inject_mode == 'all':
-            active = list(range(total_slots))
-        elif inject_mode == 'down_mid':
-            active = list(range(n_down + 1))
-        else:  # down
-            active = list(range(n_down))
-        if not active:
-            raise ValueError('Wave injection mode produced no active residual slots')
-        self.active_slot_indices = tuple(active)
-        self.active_slot_set = set(active)
+                           temb_channels=temb_channels, inject_mode=inject_mode,
+                           inject_down_slots=resolved_down_slots,
+                           active_slot_indices=list(resolved_active),
+                           topology_signature=resolved_signature)
+        self.active_slot_indices = resolved_active
+        self.active_slot_set = set(resolved_active)
         self.inactive_slot_indices = tuple(i for i in range(total_slots) if i not in self.active_slot_set)
+        self.slot_to_zero_index = {slot: j for j, slot in enumerate(self.active_slot_indices)}
         # Non-gradient RMS buffers; EMA updates occur only after successful optimizer steps.
         self.register_buffer('band_rms', torch.ones(10))
         self.register_buffer('rms_fitted', torch.tensor(False))
@@ -760,16 +869,15 @@ class WaveConditioner(nn.Module):
         # one tensor per residual slot. Only active slots have learned ZeroConv
         # heads; inactive slots are exact zeros and therefore cannot receive or
         # backpropagate a learned Wave injection.
-        layer_by_slot = dict(zip(self.active_slot_indices, self.zero))
         outputs = []
         for i, slot in enumerate(self.spec['slots']):
             scale = slot['scale']
             x = fused[scale]
-            layer = layer_by_slot.get(i)
-            if layer is None:
+            zero_index = self.slot_to_zero_index.get(i)
+            if zero_index is None:
                 outputs.append(x.new_zeros((batch, slot['channels'], x.shape[-2], x.shape[-1])))
             else:
-                outputs.append(self.strength * layer(x))
+                outputs.append(self.strength * self.zero[zero_index](x))
         return outputs
 
     @torch.no_grad()

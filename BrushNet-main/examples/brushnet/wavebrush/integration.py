@@ -8,7 +8,7 @@ import torch
 from PIL import Image
 from .core import (
     WaveConditioner, PRESETS, slot_spec, flatten_residuals, merge_residuals,
-    haar_pyramid, BANDS,
+    haar_pyramid, BANDS, INJECT_MODES, resolve_active_slot_indices,
 )
 
 
@@ -18,8 +18,18 @@ def add_wave_args(parser):
     parser.add_argument('--wave_resume', type=str, help='Warm-start wave folder; not optimizer resume')
     parser.add_argument('--wave_widths', type=int, nargs=4, default=[32,64,96,128])
     parser.add_argument('--wave_adapter', choices=['legacy','unet','selfattn','hybrid','crossattn'], default='unet')
-    parser.add_argument('--wave_inject_mode', choices=['all','down_mid','down'], default='all',
-                        help='Wave residual topology: all=down+mid+up, down_mid=down+mid only, down=down only')
+    parser.add_argument('--wave_inject_mode', choices=list(INJECT_MODES), default='all',
+                        help=(
+                            'Wave residual topology: all=down+mid+up; down_mid=all Down+Mid; '
+                            'down=all Down; stage_exit_mid=last Down slot at each scale + Mid; '
+                            'sparse5_custom=exactly one user-selected Down slot per scale + automatic Mid'
+                        ))
+    parser.add_argument('--wave_inject_down_slots', type=int, nargs=4, default=None,
+                        metavar=('S0','S1','S2','S3'),
+                        help=(
+                            'Only for --wave_inject_mode sparse5_custom: exactly four Down residual slot IDs, '
+                            'with exactly one slot from each Wave scale 0/1/2/3. Mid is appended automatically.'
+                        ))
     parser.add_argument('--wave_use_sd_temb', action='store_true',
                         help='Use frozen SD UNet timestep embedding inside Wave UNet/selfattn/hybrid adapters')
     parser.add_argument('--wave_gate', choices=['fixed','constant','time'])
@@ -117,6 +127,9 @@ def build_wave(brushnet, args, device, timesteps=1000, unet=None):
                       brushnet_cond=torch.zeros(1,5,res//8,res//8,device=device,dtype=p.dtype),return_dict=False)
     spec = slot_spec(result,(res//8,res//8))
     brushnet.train(mode)
+    requested_active_slots = resolve_active_slot_indices(
+        spec, args.wave_inject_mode, args.wave_inject_down_slots
+    )
     temb_channels = sd_time_embed_dim(unet) if args.wave_use_sd_temb else None
     if args.wave_resume:
         wave = WaveConditioner.from_pretrained(args.wave_resume,device)
@@ -128,7 +141,12 @@ def build_wave(brushnet, args, device, timesteps=1000, unet=None):
         if saved_inject_mode != args.wave_inject_mode:
             raise ValueError(
                 f'Wave warm-start inject_mode={saved_inject_mode} differs from requested '
-                f'{args.wave_inject_mode}; topology changes require a fresh/matching Wave checkpoint'
+                f'{args.wave_inject_mode}; use a matching Wave checkpoint or start fresh'
+            )
+        if tuple(wave.active_slot_indices) != tuple(requested_active_slots):
+            raise ValueError(
+                f'Wave warm-start active slots {list(wave.active_slot_indices)} differ from requested '
+                f'{list(requested_active_slots)}; topology changes require a fresh/matching Wave checkpoint'
             )
     else:
         options = dict(PRESETS[args.wave_preset])
@@ -140,7 +158,8 @@ def build_wave(brushnet, args, device, timesteps=1000, unet=None):
                                gate_max=args.wave_gate_max,gate_init=args.wave_gate_init,timesteps=timesteps,
                                soft_lambda=args.wave_soft_lambda,shared=args.wave_shared,coarse_only=args.wave_coarse_only,
                                adapter_type=args.wave_adapter,cross_attention_dim=cross_dim,cross_attention_heads=8,
-                               temb_channels=temb_channels, inject_mode=args.wave_inject_mode).to(device)
+                               temb_channels=temb_channels, inject_mode=args.wave_inject_mode,
+                               inject_down_slots=args.wave_inject_down_slots).to(device)
         if options['transform'] != 'rgb' and args.wave_rms:
             data = json.loads(Path(args.wave_rms).read_text())
             if data.get('resolution') != args.resolution:
@@ -266,6 +285,8 @@ def wave_inference(brushnet,wave,images,masks,trace=None,unet=None,region_min_fr
                 branch_rms=projected_branch_rms,
                 branch_summary=branch_summary(projected_branch_rms, wave.active_slot_indices),
                 inject_mode=wave.config.get('inject_mode', 'all'),
+                inject_down_slots=wave.config.get('inject_down_slots'),
+                topology_signature=wave.config.get('topology_signature'),
                 active_slot_indices=list(wave.active_slot_indices),
                 region_min_fraction=float(region_min_fraction),
             )
@@ -422,6 +443,8 @@ def wave_input_stats(wave, image, hole):
         'gate_override': cfg.get('gate_override'),
         'wave_strength': cfg.get('wave_strength', 1.0),
         'inject_mode': cfg.get('inject_mode', 'all'),
+        'inject_down_slots': cfg.get('inject_down_slots'),
+        'topology_signature': cfg.get('topology_signature'),
         'active_slot_indices': list(wave.active_slot_indices),
         'rms_fitted': bool(wave.rms_fitted.item()),
         'rms_updates': int(wave.rms_updates.item()),

@@ -902,6 +902,14 @@ def parse_args(input_args=None):
 
     if args.resolution % 64 or args.rms_init_batches < 1:
         raise ValueError('Wave resolution must be divisible by 64; rms_init_batches must be positive')
+    if args.wave_inject_mode == 'sparse5_custom' and args.wave_inject_down_slots is None:
+        raise ValueError(
+            '--wave_inject_mode sparse5_custom requires --wave_inject_down_slots with exactly four Down slots'
+        )
+    if args.wave_inject_mode != 'sparse5_custom' and args.wave_inject_down_slots is not None:
+        raise ValueError(
+            '--wave_inject_down_slots is valid only with --wave_inject_mode sparse5_custom'
+        )
     if not args.train_brushnet and not args.brushnet_model_name_or_path:
         raise ValueError('--freeze_brushnet requires pretrained BrushNet weights')
     if args.wave_preset == 'B0' and not args.train_brushnet:
@@ -1204,11 +1212,13 @@ def main(args):
     wave = build_wave(brushnet, args, accelerator.device, noise_scheduler.config.num_train_timesteps, unet=unet)
     if wave is not None:
         logger.info(
-            "Wave injection topology: mode=%s, active_slots=%d/%d, indices=%s",
+            "Wave injection topology: mode=%s, down_slots=%s, active_slots=%d/%d, indices=%s, signature=%s",
             wave.config.get('inject_mode', 'all'),
+            wave.config.get('inject_down_slots'),
             len(wave.active_slot_indices),
             len(wave.spec['slots']),
             list(wave.active_slot_indices),
+            wave.config.get('topology_signature'),
             main_process_only=True,
         )
     wave_env = build_wave_residual_envelope(

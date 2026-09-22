@@ -75,6 +75,33 @@ def _load_cap_file(path: Optional[str]) -> dict:
     return data
 
 
+def _validate_cap_topology(cap_file: dict, active_slot_indices) -> None:
+    """Reject topology-aware cap files calibrated for a different active-slot set.
+
+    Older cap files without topology metadata remain loadable for backward
+    compatibility. New cap files produced by the supplied builder include
+    metadata.active_slot_indices and are checked strictly.
+    """
+    if not cap_file:
+        return
+    metadata = cap_file.get('metadata', {})
+    file_active = metadata.get('active_slot_indices') if isinstance(metadata, dict) else None
+    if file_active is None:
+        file_active = cap_file.get('active_slot_indices')
+    if file_active is None:
+        return
+    try:
+        file_active = tuple(int(i) for i in file_active)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('Cap JSON active_slot_indices must be a list of integers') from exc
+    current = tuple(int(i) for i in active_slot_indices)
+    if file_active != current:
+        raise ValueError(
+            f'Cap topology active slots {list(file_active)} differ from current Wave active slots {list(current)}. '
+            'Build caps from traces produced by the same injection topology.'
+        )
+
+
 def _cap_table(
     region: str,
     fixed_c: Optional[float],
@@ -399,6 +426,12 @@ def build_wave_residual_envelope(args, wave, num_train_timesteps: int, device):
     active_slot_indices = list(getattr(wave, 'active_slot_indices', range(num_slots)))
     num_bins = int(args.wave_env_bins)
     cap_file = _load_cap_file(args.wave_env_caps_json)
+    uses_cap_file = any(
+        weights[region] > 0 and getattr(args, f'wave_env_{region}_c') is None
+        for region in REGIONS
+    )
+    if uses_cap_file:
+        _validate_cap_topology(cap_file, active_slot_indices)
 
     caps = {}
     slot_weights = {}

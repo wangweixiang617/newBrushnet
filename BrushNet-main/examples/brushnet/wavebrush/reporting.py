@@ -12,8 +12,14 @@ def parameter_report(wave, brushnet=None):
         out['config'] = wave.config
         active = list(getattr(wave, 'active_slot_indices', range(len(wave.spec['slots']))))
         layer_by_slot = {slot: layer for slot, layer in zip(active, wave.zero)}
+        out['public_residual_slots'] = len(wave.spec['slots'])
+        out['active_wave_slots'] = len(active)
+        out['inactive_wave_slots'] = len(wave.spec['slots']) - len(active)
         out['active_slot_indices'] = active
         out['inactive_slot_indices'] = [i for i in range(len(wave.spec['slots'])) if i not in layer_by_slot]
+        out['inject_mode'] = wave.config.get('inject_mode', 'all')
+        out['inject_down_slots'] = wave.config.get('inject_down_slots')
+        out['topology_signature'] = wave.config.get('topology_signature')
         out['slots'] = [
             dict(
                 slot=i,
