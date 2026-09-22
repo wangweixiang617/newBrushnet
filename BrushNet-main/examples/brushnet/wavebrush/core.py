@@ -615,8 +615,7 @@ class HostAwareFusionHead(nn.Module):
                 f'host={host_residual.shape[-2:]}'
             )
         w = self.wave_norm(self.wave_proj(wave_feature))
-        h = self.host_proj(host_residual)
-        # h = self.host_norm(self.host_proj(host_residual))
+        h = self.host_norm(self.host_proj(host_residual))
         x = self.mix(torch.cat([w, h], dim=1))
         residual = x
         x = self.local(F.silu(self.norm(x)))
@@ -755,7 +754,7 @@ class WaveConditioner(nn.Module):
                     HostAwareFusionHead(
                         wave_channels=wave_channels,
                         host_channels=slot['channels'],
-                        hidden_channels=widths[scale] * 2,
+                        hidden_channels=widths[scale],
                     )
                 )
         # Runtime interventions contain no learned parameters, but are persisted in config.json
