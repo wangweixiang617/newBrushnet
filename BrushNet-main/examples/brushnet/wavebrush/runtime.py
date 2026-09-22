@@ -36,7 +36,8 @@ def protocol(args, accelerator, dataset):
     keys = ('resolution', 'train_batch_size', 'gradient_accumulation_steps', 'seed', 'random_mask',
             'proportion_empty_prompts', 'train_brushnet', 'wave_preset', 'rms_mode', 'rms_ema_decay',
             'learning_rate', 'lr_scheduler', 'lr_warmup_steps', 'max_train_steps', 'mixed_precision',
-            'pretrained_model_name_or_path', 'brushnet_model_name_or_path')
+            'pretrained_model_name_or_path', 'brushnet_model_name_or_path',
+            'wave_adapter', 'wave_inject_mode', 'wave_inject_down_slots', 'wave_fusion', 'wave_use_sd_temb')
     return dict(world_size=accelerator.num_processes, dataset=dataset.fingerprint, samples=len(dataset),
                 options={k: getattr(args, k) for k in keys})
 

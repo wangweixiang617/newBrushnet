@@ -577,6 +577,53 @@ class CrossAttnUNetAdapter(nn.Module):
         return out
 
 
+class HostAwareFusionHead(nn.Module):
+    """Lightweight host-conditioned fusion that preserves the existing ZeroConv interface.
+
+    The fused Wave feature and frozen host residual are projected to the same hidden
+    width, normalized independently, locally mixed, then projected back to the
+    original fused-Wave channel count. The existing per-slot ZeroConv remains the
+    final zero-initialized correction head, so step-0 behavior is exactly the host
+    residual path.
+    """
+    def __init__(self, wave_channels, host_channels, hidden_channels):
+        super().__init__()
+        if min(wave_channels, host_channels, hidden_channels) < 1:
+            raise ValueError('Fusion channels must be positive')
+
+        groups = min(32, hidden_channels)
+        while groups > 1 and hidden_channels % groups:
+            groups -= 1
+
+        self.wave_proj = nn.Conv2d(wave_channels, hidden_channels, 1, bias=False)
+        self.host_proj = nn.Conv2d(host_channels, hidden_channels, 1, bias=False)
+        self.wave_norm = nn.GroupNorm(groups, hidden_channels)
+        self.host_norm = nn.GroupNorm(groups, hidden_channels)
+        self.mix = nn.Conv2d(2 * hidden_channels, hidden_channels, 1)
+        self.norm = nn.GroupNorm(groups, hidden_channels)
+        self.local = nn.Conv2d(
+            hidden_channels, hidden_channels, 3, padding=1, groups=hidden_channels
+        )
+        self.out_proj = nn.Conv2d(hidden_channels, wave_channels, 1, bias=False)
+
+    def forward(self, wave_feature, host_residual):
+        if wave_feature.shape[0] != host_residual.shape[0]:
+            raise ValueError('Fusion Wave/host batch mismatch')
+        if wave_feature.shape[-2:] != host_residual.shape[-2:]:
+            raise ValueError(
+                f'Fusion spatial mismatch: wave={wave_feature.shape[-2:]}, '
+                f'host={host_residual.shape[-2:]}'
+            )
+        w = self.wave_norm(self.wave_proj(wave_feature))
+        h = self.host_proj(host_residual)
+        # h = self.host_norm(self.host_proj(host_residual))
+        x = self.mix(torch.cat([w, h], dim=1))
+        residual = x
+        x = self.local(F.silu(self.norm(x)))
+        x = x + residual
+        return self.out_proj(x)
+
+
 class Gates(nn.Module):
     def __init__(self, mode='time', maximum=1., initial=.5, timesteps=1000):
         super().__init__()
@@ -610,7 +657,8 @@ class WaveConditioner(nn.Module):
                  shared=False, coarse_only=False, adapter_type='legacy', cross_attention_dim=768,
                  cross_attention_heads=8, drop_bands=None, drop_scales=None, drop_interval=None,
                  gate_override=None, wave_strength=1., temb_channels=None, inject_mode='all',
-                 inject_down_slots=None, active_slot_indices=None, topology_signature=None):
+                 inject_down_slots=None, active_slot_indices=None, topology_signature=None,
+                 fusion_mode='direct'):
         super().__init__()
         if reliability not in ('none', 'concat', 'premul', 'soft'):
             raise ValueError('Unknown reliability mode')
@@ -618,6 +666,8 @@ class WaveConditioner(nn.Module):
             raise ValueError('Unknown transform')
         if adapter_type not in ('legacy', 'unet', 'selfattn', 'hybrid', 'crossattn'):
             raise ValueError('Unknown adapter type')
+        if fusion_mode not in ('direct', 'host_concat'):
+            raise ValueError('fusion_mode must be direct or host_concat')
         if not 0 <= soft_lambda <= 1 or len(widths) != 4 or min(widths) < 1:
             raise ValueError('Invalid soft_lambda/adapter widths')
         if adapter_type == 'selfattn' and shared:
@@ -653,7 +703,7 @@ class WaveConditioner(nn.Module):
                            temb_channels=temb_channels, inject_mode=inject_mode,
                            inject_down_slots=resolved_down_slots,
                            active_slot_indices=list(resolved_active),
-                           topology_signature=resolved_signature)
+                           topology_signature=resolved_signature, fusion_mode=fusion_mode)
         self.active_slot_indices = resolved_active
         self.active_slot_set = set(resolved_active)
         self.inactive_slot_indices = tuple(i for i in range(total_slots) if i not in self.active_slot_set)
@@ -692,6 +742,22 @@ class WaveConditioner(nn.Module):
         )
         for layer in self.zero:
             nn.init.zeros_(layer.weight)
+        # Host-aware fusion is deliberately instantiated only for active slots,
+        # avoiding unused DDP parameters. It transforms the fused Wave feature
+        # before the existing zero-initialized correction head.
+        self.fusion_heads = nn.ModuleList()
+        if fusion_mode == 'host_concat':
+            for i in self.active_slot_indices:
+                slot = spec['slots'][i]
+                scale = slot['scale']
+                wave_channels = 4 * widths[scale]
+                self.fusion_heads.append(
+                    HostAwareFusionHead(
+                        wave_channels=wave_channels,
+                        host_channels=slot['channels'],
+                        hidden_channels=widths[scale] * 2,
+                    )
+                )
         # Runtime interventions contain no learned parameters, but are persisted in config.json
         # so ablation/training settings remain inspectable and round-trip through checkpoints.
         self.set_interventions(
@@ -853,7 +919,7 @@ class WaveConditioner(nn.Module):
             selected.zero_()
         return g * (~selected).to(g.dtype)
 
-    def project(self, features, timesteps):
+    def project(self, features, timesteps, host_residuals=None):
         batch = features[0][0].shape[0]
         t = torch.as_tensor(timesteps, device=features[0][0].device).reshape(-1)
         if t.numel() == 1:
@@ -862,13 +928,21 @@ class WaveConditioner(nn.Module):
             raise ValueError('Timestep batch mismatch')
         g = self.effective_gates(t)
         fused = [
-            torch.cat([features[b][s] * g[:, b, s, None, None, None].to(features[b][s].dtype) for b in range(4)], 1,)
+            torch.cat([features[b][s] * g[:, b, s, None, None, None].to(features[b][s].dtype) for b in range(4)], 1)
             for s in range(4)
         ]
+
+        fusion_mode = self.config.get('fusion_mode', 'direct')
+        if fusion_mode == 'host_concat':
+            if host_residuals is None:
+                raise ValueError('host_concat fusion requires host_residuals')
+            if len(host_residuals) != len(self.spec['slots']):
+                raise ValueError(
+                    f'Expected {len(self.spec["slots"])} host residuals, got {len(host_residuals)}'
+                )
+
         # Keep the external residual contract identical to BrushNet: always return
-        # one tensor per residual slot. Only active slots have learned ZeroConv
-        # heads; inactive slots are exact zeros and therefore cannot receive or
-        # backpropagate a learned Wave injection.
+        # one tensor per public residual slot. Inactive slots are exact zeros.
         outputs = []
         for i, slot in enumerate(self.spec['slots']):
             scale = slot['scale']
@@ -876,8 +950,19 @@ class WaveConditioner(nn.Module):
             zero_index = self.slot_to_zero_index.get(i)
             if zero_index is None:
                 outputs.append(x.new_zeros((batch, slot['channels'], x.shape[-2], x.shape[-1])))
-            else:
-                outputs.append(self.strength * self.zero[zero_index](x))
+                continue
+
+            if fusion_mode == 'host_concat':
+                host = host_residuals[i]
+                expected = (batch, slot['channels'], x.shape[-2], x.shape[-1])
+                if tuple(host.shape) != expected:
+                    raise ValueError(
+                        f'Host residual shape mismatch at slot {i}: {tuple(host.shape)} vs {expected}'
+                    )
+                # Host is conditioning only. Frozen BrushNet is not optimized through this path.
+                x = self.fusion_heads[zero_index](x, host.detach().to(device=x.device, dtype=x.dtype))
+
+            outputs.append(self.strength * self.zero[zero_index](x))
         return outputs
 
     @torch.no_grad()
@@ -887,6 +972,12 @@ class WaveConditioner(nn.Module):
         Inactive slots are retained as [0,0,0,0] rows so old 28-slot analysis
         code can still align traces by slot index.
         """
+        if self.config.get('fusion_mode', 'direct') != 'direct':
+            # Per-band exact decomposition relies on a linear projection of the
+            # concatenated bands. Host-aware fusion is nonlinear, so the old
+            # branch decomposition is intentionally disabled instead of reporting
+            # a misleading quantity.
+            return None
         batch = features[0][0].shape[0]
         t = torch.as_tensor(timesteps, device=features[0][0].device).reshape(-1)
         if t.numel() == 1:
@@ -906,8 +997,12 @@ class WaveConditioner(nn.Module):
             rows[slot_index] = values
         return rows
 
-    def forward(self, image, hole, timesteps, encoder_hidden_states=None, temb=None):
-        return self.project(self.encode(image, hole, encoder_hidden_states, temb=temb), timesteps)
+    def forward(self, image, hole, timesteps, encoder_hidden_states=None, temb=None, host_residuals=None):
+        return self.project(
+            self.encode(image, hole, encoder_hidden_states, temb=temb),
+            timesteps,
+            host_residuals=host_residuals,
+        )
 
     def save_pretrained(self, path):
         path = Path(path)

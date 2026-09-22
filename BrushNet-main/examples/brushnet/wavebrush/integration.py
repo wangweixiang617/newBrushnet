@@ -18,6 +18,8 @@ def add_wave_args(parser):
     parser.add_argument('--wave_resume', type=str, help='Warm-start wave folder; not optimizer resume')
     parser.add_argument('--wave_widths', type=int, nargs=4, default=[32,64,96,128])
     parser.add_argument('--wave_adapter', choices=['legacy','unet','selfattn','hybrid','crossattn'], default='unet')
+    parser.add_argument('--wave_fusion', choices=['direct','host_concat'], default='direct',
+                        help='direct: existing Wave residual head; host_concat: lightweight host-aware residual fusion before ZeroConv')
     parser.add_argument('--wave_inject_mode', choices=list(INJECT_MODES), default='all',
                         help=(
                             'Wave residual topology: all=down+mid+up; down_mid=all Down+Mid; '
@@ -148,6 +150,12 @@ def build_wave(brushnet, args, device, timesteps=1000, unet=None):
                 f'Wave warm-start active slots {list(wave.active_slot_indices)} differ from requested '
                 f'{list(requested_active_slots)}; topology changes require a fresh/matching Wave checkpoint'
             )
+        saved_fusion = wave.config.get('fusion_mode', 'direct')
+        if saved_fusion != args.wave_fusion:
+            raise ValueError(
+                f'Wave warm-start fusion_mode={saved_fusion} differs from requested {args.wave_fusion}; '
+                'use a matching Wave checkpoint or start fresh'
+            )
     else:
         options = dict(PRESETS[args.wave_preset])
         if args.wave_gate:
@@ -159,7 +167,8 @@ def build_wave(brushnet, args, device, timesteps=1000, unet=None):
                                soft_lambda=args.wave_soft_lambda,shared=args.wave_shared,coarse_only=args.wave_coarse_only,
                                adapter_type=args.wave_adapter,cross_attention_dim=cross_dim,cross_attention_heads=8,
                                temb_channels=temb_channels, inject_mode=args.wave_inject_mode,
-                               inject_down_slots=args.wave_inject_down_slots).to(device)
+                               inject_down_slots=args.wave_inject_down_slots,
+                               fusion_mode=args.wave_fusion).to(device)
         if options['transform'] != 'rgb' and args.wave_rms:
             data = json.loads(Path(args.wave_rms).read_text())
             if data.get('resolution') != args.resolution:
@@ -260,10 +269,13 @@ def wave_inference(brushnet,wave,images,masks,trace=None,unet=None,region_min_fr
             cached = cross_cache[n]
         else:
             cached=features if n==batch else [[f.repeat(2,1,1,1) for f in branch] for branch in features]
+        base,_,_=flatten_residuals(result)
         with torch.no_grad():
-            extra=wave.project(cached,t)
+            extra=wave.project(
+                cached, t,
+                host_residuals=base if wave.config.get('fusion_mode', 'direct') == 'host_concat' else None,
+            )
         if trace is not None:
-            base,_,_=flatten_residuals(result)
             #换个精度试试 临时关闭bf16
             with torch.autocast(device_type=device.type,enabled=False):
                 gate_tensor=wave.effective_gates(torch.as_tensor(t,device=device).reshape(-1)).detach().float().cpu()
@@ -285,6 +297,7 @@ def wave_inference(brushnet,wave,images,masks,trace=None,unet=None,region_min_fr
                 branch_rms=projected_branch_rms,
                 branch_summary=branch_summary(projected_branch_rms, wave.active_slot_indices),
                 inject_mode=wave.config.get('inject_mode', 'all'),
+                fusion_mode=wave.config.get('fusion_mode', 'direct'),
                 inject_down_slots=wave.config.get('inject_down_slots'),
                 topology_signature=wave.config.get('topology_signature'),
                 active_slot_indices=list(wave.active_slot_indices),
@@ -443,6 +456,7 @@ def wave_input_stats(wave, image, hole):
         'gate_override': cfg.get('gate_override'),
         'wave_strength': cfg.get('wave_strength', 1.0),
         'inject_mode': cfg.get('inject_mode', 'all'),
+        'fusion_mode': cfg.get('fusion_mode', 'direct'),
         'inject_down_slots': cfg.get('inject_down_slots'),
         'topology_signature': cfg.get('topology_signature'),
         'active_slot_indices': list(wave.active_slot_indices),

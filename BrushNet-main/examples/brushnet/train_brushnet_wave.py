@@ -45,7 +45,7 @@ from diffusers.utils.torch_utils import is_compiled_module
 
 from wavebrush.validation_evaluator import BrushNetValidationEvaluator
 from wavebrush.integration import add_wave_args, build_wave, wave_inference, sd_time_embedding
-from wavebrush.core import merge_residuals
+from wavebrush.core import merge_residuals, flatten_residuals
 from wavebrush.rms import RMSAccumulator, initialize_rms_from_loader
 from wavebrush.runtime import register_model_hooks, validation_guard
 from wavebrush.residual_envelope import build_wave_residual_envelope
@@ -1221,6 +1221,11 @@ def main(args):
             wave.config.get('topology_signature'),
             main_process_only=True,
         )
+        logger.info(
+            'Wave residual fusion: %s',
+            wave.config.get('fusion_mode', 'direct'),
+            main_process_only=True,
+        )
     wave_env = build_wave_residual_envelope(
         args, wave, noise_scheduler.config.num_train_timesteps, accelerator.device
     )
@@ -1642,9 +1647,17 @@ def main(args):
                         wave_temb = sd_time_embedding(
                             unet, timesteps, bsz, device=latents.device, dtype=next(wave.parameters()).dtype
                         )
+                    host_residuals, _, _ = flatten_residuals(
+                        (down_block_res_samples, mid_block_res_sample, up_block_res_samples)
+                    )
                     extra = wave(
                         batch['conditioning_pixel_values'], 1-batch['masks'], timesteps,
-                        encoder_hidden_states=encoder_hidden_states, temb=wave_temb
+                        encoder_hidden_states=encoder_hidden_states, temb=wave_temb,
+                        host_residuals=(
+                            host_residuals
+                            if args.wave_fusion == 'host_concat'
+                            else None
+                        ),
                     )
                     down_block_res_samples, mid_block_res_sample, up_block_res_samples = merge_residuals(
                         (down_block_res_samples, mid_block_res_sample, up_block_res_samples), extra)
