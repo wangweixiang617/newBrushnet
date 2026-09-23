@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Group AI Control Console</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    html,body{overflow:auto;min-width:980px}.control-shell{position:relative;z-index:2;min-height:100vh;padding:16px;background:radial-gradient(circle at 50% 0,rgba(14,57,88,.22),transparent 35%)}
+    .control-head{height:70px;display:flex;align-items:center;justify-content:space-between;padding:0 18px;margin-bottom:12px}.control-head h1{font-size:20px}.control-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}.control-card{padding-bottom:12px;min-height:220px}.control-card h2{margin:0;padding:12px 14px;border-bottom:1px solid var(--line2);font-size:12px;letter-spacing:.1em;color:#cceef7}.control-body{padding:12px}.field{display:grid;gap:5px;margin-bottom:10px}.field label{font-size:9px;color:#6f96a7;letter-spacing:.08em}.field select,.field input{height:34px;background:#061420;border:1px solid rgba(57,231,255,.16);color:#d5f4fb;padding:0 9px}.scene-buttons{display:grid;grid-template-columns:1fr 1fr;gap:7px}.scene-buttons button{min-height:40px}.span2{grid-column:span 2}.span3{grid-column:span 3}.log-box{height:260px;overflow:auto;background:rgba(0,0,0,.18);padding:8px;font:10px Consolas;color:#86aebe}.log-line{padding:5px;border-bottom:1px solid rgba(57,231,255,.05)}.control-table{width:100%;border-collapse:collapse;font-size:9px}.control-table th,.control-table td{padding:7px;border-bottom:1px solid rgba(57,231,255,.07);text-align:left}.control-table th{color:#5e8b9d}.status-badge{padding:2px 6px;border:1px solid rgba(57,231,255,.15)}
+  </style>
+</head>
+<body>
+<canvas id="ambient-canvas"></canvas><div class="scan-overlay"></div>
+<div class="control-shell">
+  <header class="control-head hud-frame"><div><div class="eyebrow">OPERATOR CONSOLE</div><h1>集团 AI 作战室控制台</h1></div><div><a href="/war-room" target="_blank" class="action-btn">打开大屏</a></div></header>
+  <div class="control-grid">
+    <section class="control-card hud-frame"><h2>01 · 场景控制</h2><div class="control-body">
+      <div class="field"><label>当前分公司</label><select id="company-select"></select></div>
+      <div class="field"><label>分析指标</label><select id="metric-select"><option value="profit_margin">营业利润率</option><option value="cash_flow">现金流</option><option value="employee_sentiment">员工情绪指数</option><option value="employee_turnover">员工流失率</option><option value="risk_score">风险指数</option><option value="project_delay_days">项目延期</option></select></div>
+      <div class="scene-buttons" id="scene-buttons"><button class="action-btn" data-scene="overview">集团态势</button><button class="action-btn" data-scene="analytics">经营分析</button><button class="action-btn" data-scene="profile">企业画像</button><button class="action-btn" data-scene="investment">投资分析</button><button class="action-btn" data-scene="twin">数字孪生</button><button class="action-btn" data-scene="monitor">AI监控</button><button class="action-btn span2" data-scene="decision">AI决策</button></div>
+    </div></section>
+    <section class="control-card hud-frame"><h2>02 · AI 事件与决策</h2><div class="control-body">
+      <div class="scene-buttons"><button id="demo-alert" class="action-btn danger">触发 CRITICAL 演示预警</button><button id="start-diagnosis" class="action-btn">启动 AI 诊断</button><button id="start-simulation" class="action-btn secondary">启动方案仿真</button><button id="run-scan" class="action-btn secondary">立即扫描全部指标</button></div>
+      <div class="field" style="margin-top:12px"><label>文字/语音控制指令</label><div class="voice-input-row"><input id="command-text" placeholder="例如：分析上海分公司为什么利润下降"><button id="command-send">执行</button><button id="command-voice">🎙</button></div></div>
+      <div id="intent-result" class="insight-card">等待操作指令...</div>
+    </div></section>
+    <section class="control-card hud-frame"><h2>03 · 系统状态</h2><div class="control-body"><div id="system-status" class="big-kpis"></div><div class="mini-section-title">实时消息</div><div id="live-log" class="log-box"></div></div></section>
+
+    <section class="control-card hud-frame span2"><h2>04 · AI Monitor 规则</h2><div class="control-body"><table class="control-table"><thead><tr><th>域</th><th>指标</th><th>规则</th><th>级别</th><th>语音</th><th>自动决策</th></tr></thead><tbody id="rules-body"></tbody></table></div></section>
+    <section class="control-card hud-frame"><h2>05 · 新增监测规则</h2><div class="control-body">
+      <div class="field"><label>监测域</label><input id="rule-domain" value="财务"></div><div class="field"><label>指标字段</label><select id="rule-metric"><option value="profit_margin">profit_margin</option><option value="cash_flow">cash_flow</option><option value="employee_sentiment">employee_sentiment</option><option value="employee_turnover">employee_turnover</option><option value="risk_score">risk_score</option><option value="project_delay_days">project_delay_days</option></select></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><div class="field"><label>运算符</label><select id="rule-op"><option>&lt;</option><option>&gt;</option><option>&lt;=</option><option>&gt;=</option></select></div><div class="field"><label>阈值</label><input id="rule-threshold" type="number" value="8"></div></div>
+      <div class="field"><label>级别</label><select id="rule-severity"><option>WARNING</option><option>CRITICAL</option><option>NOTICE</option></select></div><button id="add-rule" class="action-btn">新增规则</button>
+    </div></section>
+
+    <section class="control-card hud-frame span3"><h2>06 · 决策审计记录</h2><div class="control-body"><table class="control-table"><thead><tr><th>时间</th><th>企业</th><th>方案</th><th>操作人</th><th>说明</th></tr></thead><tbody id="decisions-body"></tbody></table></div></section>
+  </div>
+</div>
+<script src="/static/js/visuals.js"></script><script src="/static/js/control.js"></script>
+</body></html>

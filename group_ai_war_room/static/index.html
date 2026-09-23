@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#020812">
+  <title>GROUP AI COMMAND CENTER</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<canvas id="ambient-canvas" aria-hidden="true"></canvas>
+<div class="scan-overlay" aria-hidden="true"></div>
+<div id="app" class="war-room">
+  <header class="topbar hud-frame">
+    <div class="brand-block">
+      <div class="brand-mark"><i></i><i></i><i></i></div>
+      <div><div class="eyebrow">GROUP AI DIGITAL TWIN</div><h1 id="group-name">集团 AI 作战指挥中心</h1></div>
+    </div>
+    <div class="command-status">
+      <span class="status-chip"><b class="dot online"></b>AI ONLINE</span>
+      <span class="status-chip" id="mode-chip">AMBIENT MODE</span>
+      <span class="status-chip" id="company-chip">CURRENT · --</span>
+      <button id="ambient-toggle" class="icon-btn" title="自动巡航">AUTO</button>
+      <button id="fullscreen-btn" class="icon-btn" title="全屏">⛶</button>
+    </div>
+    <div class="clock-block"><span id="clock-date">--</span><strong id="clock-time">--:--:--</strong></div>
+  </header>
+
+  <nav class="scene-nav hud-frame" aria-label="场景导航">
+    <button data-scene-target="overview" class="active"><span>01</span>集团态势</button>
+    <button data-scene-target="analytics"><span>02</span>经营分析</button>
+    <button data-scene-target="profile"><span>03</span>企业画像</button>
+    <button data-scene-target="investment"><span>04</span>投资分析</button>
+    <button data-scene-target="twin"><span>05</span>数字孪生</button>
+    <button data-scene-target="monitor"><span>06</span>AI监控</button>
+    <button data-scene-target="decision"><span>07</span>AI决策</button>
+  </nav>
+
+  <main id="scene-stage" class="scene-stage">
+    <section class="scene-page active" data-scene="overview">
+      <div class="overview-grid">
+        <aside class="panel kpi-column hud-frame">
+          <div class="panel-title"><span>GROUP VITALS</span><b>集团生命体征</b></div>
+          <div id="group-kpis" class="kpi-stack"></div>
+          <div class="mini-section-title">综合健康度</div>
+          <div class="health-orb" id="health-orb"><div class="orb-ring r1"></div><div class="orb-ring r2"></div><strong id="health-score">--</strong><span>GROUP HEALTH</span></div>
+        </aside>
+        <section class="panel strategic-panel hud-frame">
+          <div class="panel-title"><span>STRATEGIC SITUATION</span><b>全国分公司战略态势</b></div>
+          <div class="map-wrap">
+            <svg id="strategic-map" viewBox="0 0 1000 570" role="img" aria-label="全国分公司态势图"></svg>
+            <div class="map-legend"><span><i class="l-dot normal"></i>NORMAL</span><span><i class="l-dot warn"></i>WARNING</span><span><i class="l-dot critical"></i>CRITICAL</span></div>
+            <div class="map-focus-card" id="map-focus-card"><span>SELECTED ENTITY</span><strong>--</strong><em>--</em></div>
+          </div>
+          <div class="trend-strip">
+            <div class="trend-head"><span>GROUP OPERATING TREND</span><b>集团经营趋势</b></div>
+            <canvas id="overview-trend"></canvas>
+          </div>
+        </section>
+        <aside class="panel intelligence-column hud-frame">
+          <div class="panel-title"><span>AI INTELLIGENCE</span><b>AI 情报流</b></div>
+          <div class="ai-watch"><div class="watch-core"><span>AI</span><b>WATCHING</b></div><div class="watch-ring a"></div><div class="watch-ring b"></div></div>
+          <div id="ai-insight" class="insight-card"></div>
+          <div class="mini-section-title">EVENT STREAM</div>
+          <div id="event-stream" class="event-stream"></div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="scene-page" data-scene="analytics">
+      <div class="analytics-grid">
+        <section class="panel hud-frame rank-panel">
+          <div class="panel-title"><span>SUBSIDIARY RANKING</span><b>企业综合排行</b></div>
+          <div class="metric-tabs" id="ranking-tabs">
+            <button data-metric="score" class="active">综合</button><button data-metric="revenue">营收</button><button data-metric="profit_margin">利润率</button><button data-metric="growth">增长</button><button data-metric="risk_score">风险</button>
+          </div>
+          <div id="ranking-bars" class="ranking-bars"></div>
+        </section>
+        <section class="panel hud-frame quadrant-panel">
+          <div class="panel-title"><span>ENTERPRISE PORTRAIT MATRIX</span><b>企业画像四象限</b></div>
+          <svg id="quadrant-svg" viewBox="0 0 900 640" role="img" aria-label="企业画像四象限"></svg>
+          <div class="quadrant-detail" id="quadrant-detail"></div>
+        </section>
+        <section class="panel hud-frame indicator-panel">
+          <div class="panel-title"><span>INDICATOR ANALYTICS</span><b>指标分析</b></div>
+          <div class="metric-select-row"><select id="indicator-select"></select><span id="indicator-current">--</span></div>
+          <canvas id="indicator-chart"></canvas>
+          <div class="forecast-row"><span>趋势预测</span><strong id="forecast-value">--</strong><em id="forecast-note">--</em></div>
+          <div class="benchmark-grid" id="benchmark-grid"></div>
+        </section>
+      </div>
+    </section>
+
+    <section class="scene-page" data-scene="profile">
+      <div class="profile-grid">
+        <section class="panel hud-frame profile-hero">
+          <div class="panel-title"><span>ENTERPRISE DIGITAL DNA</span><b>企业数字孪生画像</b></div>
+          <svg id="enterprise-orbit" viewBox="0 0 1000 720" role="img" aria-label="企业数字孪生画像"></svg>
+          <div class="profile-center-label"><span id="profile-industry">--</span><strong id="profile-name">--</strong><em id="profile-status">--</em></div>
+        </section>
+        <section class="panel hud-frame radar-panel">
+          <div class="panel-title"><span>CAPABILITY RADAR</span><b>能力雷达</b></div>
+          <canvas id="profile-radar"></canvas>
+          <div id="profile-scores" class="score-list"></div>
+        </section>
+        <section class="panel hud-frame history-panel">
+          <div class="panel-title"><span>HISTORICAL PULSE</span><b>历史趋势</b></div>
+          <div class="history-switch"><button data-history-metric="profit_margin" class="active">利润率</button><button data-history-metric="employee_sentiment">员工状态</button><button data-history-metric="cash_flow">现金流</button></div>
+          <canvas id="profile-history"></canvas>
+          <div id="profile-facts" class="fact-grid"></div>
+        </section>
+      </div>
+    </section>
+
+    <section class="scene-page" data-scene="investment">
+      <div class="investment-grid">
+        <section class="panel hud-frame invest-structure">
+          <div class="panel-title"><span>CAPITAL STRUCTURE</span><b>集团投资结构</b></div>
+          <canvas id="sunburst-canvas"></canvas>
+          <div id="sunburst-legend" class="sunburst-legend"></div>
+        </section>
+        <section class="panel hud-frame invest-ranking">
+          <div class="panel-title"><span>NPV RANKING</span><b>投资价值排行</b></div>
+          <div id="investment-ranking" class="investment-ranking"></div>
+        </section>
+        <section class="panel hud-frame invest-current">
+          <div class="panel-title"><span>CURRENT ENTITY</span><b>当前企业投资雷达</b></div>
+          <div id="investment-kpis" class="big-kpis"></div>
+          <canvas id="investment-bars"></canvas>
+          <div id="investment-projects" class="project-list"></div>
+        </section>
+      </div>
+    </section>
+
+    <section class="scene-page" data-scene="twin">
+      <div class="twin-grid">
+        <section class="panel hud-frame twin-main">
+          <div class="panel-title"><span>DIGITAL TWIN NETWORK</span><b>集团数字孪生数据网络</b></div>
+          <svg id="twin-network" viewBox="0 0 1200 720" role="img" aria-label="数字孪生网络"></svg>
+          <div class="twin-status-line"><span id="twin-status">SYSTEM IDLE</span><div class="running-dots"><i></i><i></i><i></i></div></div>
+        </section>
+        <aside class="panel hud-frame twin-side">
+          <div class="panel-title"><span>TWIN TELEMETRY</span><b>数字孪生状态</b></div>
+          <div id="twin-domain-list" class="twin-domain-list"></div>
+          <div class="mini-section-title">DATA INGESTION</div>
+          <div class="ingestion-meter"><span>DATABASE</span><b id="ingest-rate">--</b><em>records/s</em><i></i></div>
+          <div class="ingestion-meter"><span>AI PIPELINE</span><b id="ai-rate">--</b><em>analysis/s</em><i></i></div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="scene-page" data-scene="monitor">
+      <div class="monitor-grid">
+        <section class="panel hud-frame monitor-main">
+          <div class="panel-title"><span>AI CONTINUOUS MONITOR</span><b>AI 持续监测中心</b></div>
+          <div id="monitor-wheel" class="monitor-wheel"><div class="monitor-beam"></div><div class="monitor-core"><strong>AI</strong><span id="monitor-state">SCANNING</span><em id="monitor-progress">00%</em></div></div>
+          <div class="monitor-message" id="monitor-message">正在建立企业数字孪生监控上下文...</div>
+        </section>
+        <section class="panel hud-frame monitor-domains">
+          <div class="panel-title"><span>MONITOR DOMAINS</span><b>监测域</b></div>
+          <div id="monitor-domain-list" class="monitor-domain-list"></div>
+        </section>
+        <section class="panel hud-frame monitor-rules">
+          <div class="panel-title"><span>ACTIVE RULES</span><b>监控规则</b></div>
+          <div id="rules-list" class="rules-list"></div>
+          <button id="trigger-demo-alert" class="action-btn danger">触发演示预警</button>
+        </section>
+      </div>
+    </section>
+
+    <section class="scene-page" data-scene="decision">
+      <div class="decision-grid">
+        <section class="panel hud-frame decision-core-panel">
+          <div class="panel-title"><span>AI DECISION ENGINE</span><b>AI 决策引擎</b></div>
+          <div class="decision-core-wrap">
+            <div class="decision-core"><div class="dc-ring r1"></div><div class="dc-ring r2"></div><div class="dc-scan"></div><strong>AI</strong><span id="decision-core-state">READY</span></div>
+            <div id="decision-packets" class="decision-packets"></div>
+          </div>
+          <div id="diagnostic-timeline" class="diagnostic-timeline"></div>
+        </section>
+        <section class="panel hud-frame causal-panel">
+          <div class="panel-title"><span>CAUSAL GRAPH</span><b>原因关系图</b></div>
+          <svg id="causal-svg" viewBox="0 0 900 560" role="img" aria-label="AI 原因关系图"></svg>
+          <div id="diagnosis-summary" class="diagnosis-summary">等待 AI 诊断...</div>
+        </section>
+        <section class="panel hud-frame option-panel">
+          <div class="panel-title"><span>DECISION OPTIONS</span><b>方案生成与选择</b></div>
+          <div id="option-cards" class="option-cards"><div class="option-placeholder">等待决策方案生成</div></div>
+          <div class="simulation-head"><span>MONTE CARLO SIMULATION</span><strong id="sim-counter">0 / 5000</strong></div>
+          <div id="simulation-bars" class="simulation-bars"></div>
+          <div class="decision-actions"><button id="run-decision" class="action-btn">启动 AI 决策分析</button><button id="simulate-options" class="action-btn secondary" disabled>重新仿真</button></div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <footer class="ticker hud-frame"><span class="ticker-label">LIVE INTELLIGENCE</span><div class="ticker-window"><div id="ticker-content" class="ticker-content">系统启动中 · 正在加载集团数据...</div></div><span class="connection-indicator"><i id="sse-dot"></i><b id="sse-status">CONNECTING</b></span></footer>
+
+  <div id="alert-overlay" class="alert-overlay" aria-live="assertive" aria-hidden="true">
+    <div class="alert-modal hud-frame critical-frame">
+      <div class="alert-scan"></div><div class="alert-code">AI RISK EVENT</div><div class="alert-level" id="alert-level">CRITICAL</div>
+      <h2 id="alert-title">AI 风险预警</h2><p id="alert-message">--</p>
+      <div class="alert-metrics"><div><span>ENTITY</span><b id="alert-company">--</b></div><div><span>CURRENT</span><b id="alert-value">--</b></div><div><span>THRESHOLD</span><b id="alert-threshold">--</b></div></div>
+      <div class="alert-actions"><button id="alert-diagnose" class="action-btn danger">进入 AI 诊断</button><button id="alert-dismiss" class="action-btn secondary">暂时关闭</button></div>
+    </div>
+  </div>
+
+  <div class="voice-console hud-frame" id="voice-console">
+    <button id="voice-btn" class="voice-orb" title="语音指令"><span>AI</span></button>
+    <div class="voice-body"><div class="voice-title"><span id="voice-state">AI ASSISTANT</span><b id="voice-status">READY</b></div><div id="voice-wave" class="voice-wave">▂▃▅▂▆▄▂▁</div><div class="voice-input-row"><input id="voice-text" placeholder="例如：分析上海分公司最近利润为什么下降"><button id="voice-send">执行</button></div></div>
+  </div>
+</div>
+<script src="/static/js/charts.js"></script>
+<script src="/static/js/visuals.js"></script>
+<script src="/static/js/voice.js"></script>
+<script src="/static/js/warroom.js"></script>
+</body>
+</html>
