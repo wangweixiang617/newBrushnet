@@ -1,0 +1,116 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>集团 AI 数字孪生作战指挥中心</title><link rel="stylesheet" href="/static/css/style.css?v=4.6"></head>
+<body>
+<div id="app" class="warroom-shell">
+  <canvas id="ambient-canvas" aria-hidden="true"></canvas>
+  <header class="topbar hud-frame">
+    <div class="brand"><div class="brand-mark"><i></i></div><div><div class="eyebrow">GROUP AI DIGITAL TWIN</div><h1 id="group-name">集团 AI 作战指挥中心</h1></div></div>
+    <div class="top-status">
+      <span class="status-pill online"><i></i><span class="status-text">AI ONLINE</span></span><span class="status-pill"><span class="status-text">OPERATOR MODE</span></span>
+      <button id="current-company-btn" class="status-pill current-company">CURRENT · <b id="current-company-name">--</b><span>⌄</span></button>
+      <button id="ambient-toggle" class="status-pill">AMBIENT</button><button id="fullscreen-btn" class="icon-btn" title="全屏">⛶</button>
+    </div>
+    <div class="clock"><small id="date-text"></small><b id="clock-text">00:00:00</b></div>
+  </header>
+
+  <nav class="scene-nav hud-frame" aria-label="主导航">
+    <button data-scene-target="overview" class="active"><span>01</span>集团态势</button>
+    <button data-scene-target="analytics"><span>02</span>经营分析</button>
+    <button data-scene-target="profile"><span>03</span>企业画像</button>
+    <button data-scene-target="investment"><span>04</span>投资分析</button>
+    <button data-scene-target="twin"><span>05</span>数字孪生</button>
+    <button data-scene-target="monitor"><span>06</span>AI监控</button>
+    <button data-scene-target="decision"><span>07</span>AI决策</button>
+    <button data-scene-target="metrics"><span>08</span>指标全景</button>
+  </nav>
+
+  <main class="scene-stack">
+    <section class="scene-page active" data-scene="overview">
+      <div class="overview-grid">
+        <article class="panel hud-frame kpi-panel"><div class="panel-head"><span>GROUP KPI</span><b>集团经营总览</b></div><div id="group-kpis" class="kpi-grid"></div></article>
+        <article class="panel hud-frame map-panel"><div class="panel-head"><span>STRATEGIC MAP</span><b>全国企业战略态势</b></div><div class="map-wrap"><canvas id="strategy-map"></canvas><div id="map-legend" class="map-legend"></div></div></article>
+        <article class="panel hud-frame intel-panel"><div class="panel-head"><span>AI INTELLIGENCE</span><b>实时情报</b></div><div id="intel-stream" class="intel-stream"></div></article>
+        <article class="panel hud-frame trend-panel"><div class="panel-head"><span>GROUP TREND</span><b>集团营业收入脉冲</b></div><canvas id="group-trend"></canvas></article>
+        <article class="panel hud-frame risk-panel"><div class="panel-head"><span>RISK RADAR</span><b>分公司风险排行</b></div><div id="risk-ranking" class="compact-ranking"></div></article>
+      </div>
+    </section>
+
+    <section class="scene-page" data-scene="analytics">
+      <div class="analytics-grid">
+        <article class="panel hud-frame ranking-panel"><div class="panel-head"><span>SUBSIDIARY RANKING</span><b>企业综合排行</b></div>
+          <div class="rank-tabs" id="rank-tabs">
+            <button data-rank="composite_score" class="active">综合评分</button><button data-rank="basic_score">基础得分</button><button data-rank="operation_score">经营得分</button><button data-rank="technology_score">科技得分</button><button data-rank="supervision_score">监管得分</button>
+          </div><div id="ranking-list" class="ranking-list"></div>
+        </article>
+        <article class="panel hud-frame quadrant-panel"><div class="panel-head"><span>ENTERPRISE PORTRAIT MATRIX</span><b>经营 × 基础 四象限</b></div>
+          <div class="quadrant-note"><span>X 轴：经营得分</span><span>Y 轴：基础得分</span><span>气泡大小：综合评分</span></div><svg id="quadrant-svg" viewBox="0 0 1000 660" preserveAspectRatio="xMidYMid meet"></svg>
+          <div id="quadrant-company-summary" class="quadrant-company-summary"></div>
+        </article>
+        <article class="panel hud-frame indicator-panel"><div class="panel-head"><span>INDICATOR ANALYTICS</span><b>指标分析</b></div><div class="indicator-toolbar"><select id="quick-metric-select"></select><strong id="quick-metric-value">--</strong></div><canvas id="quick-metric-chart"></canvas><div id="quick-metric-stats" class="mini-stat-grid"></div><button id="open-metric-panorama" class="action-btn">进入完整指标全景</button></article>
+      </div>
+    </section>
+
+    <section class="scene-page" data-scene="profile">
+      <div class="profile-layout">
+        <article class="panel hud-frame profile-main"><div class="panel-head"><span>ENTERPRISE DIGITAL DNA</span><b>企业数字孪生画像</b></div>
+          <div class="profile-toolbar"><button id="profile-company-search" class="company-search-trigger"><span>当前企业</span><b id="profile-company-name">--</b><em>点击搜索 / 切换企业</em></button><div id="profile-badges" class="profile-badges"></div></div>
+          <svg id="profile-orbit-svg" viewBox="0 0 1000 660"></svg>
+          <div class="profile-help">点击「基础 / 经营 / 科技 / 监管」画像进入深度分析；节点分数、数据流和色彩均由当前企业数据驱动。</div>
+        </article>
+        <article class="panel hud-frame radar-panel"><div class="panel-head"><span>CAPABILITY RADAR</span><b>四维能力雷达</b></div><canvas id="profile-radar"></canvas><div id="profile-score-table" class="profile-score-table"></div></article>
+        <article class="panel hud-frame profile-pulse"><div class="panel-head"><span>HISTORICAL PULSE</span><b>经营脉冲</b></div><div class="rank-tabs small"><button data-pulse="revenue" class="active">营收</button><button data-pulse="roe">ROE</button><button data-pulse="employee_sentiment">员工状态</button></div><canvas id="profile-pulse-chart"></canvas><div id="profile-pulse-kpis" class="mini-stat-grid"></div></article>
+      </div>
+    </section>
+
+    <section class="scene-page" data-scene="investment">
+      <div class="investment-grid-v4">
+        <article class="panel hud-frame investment-company-list"><div class="panel-head"><span>ENTITY LIST</span><b>企业投资对象</b></div><input id="investment-company-search" class="search-input" placeholder="搜索企业 / 城市"><div id="investment-company-list" class="company-list"></div></article>
+        <article class="panel hud-frame investment-sunburst"><div class="panel-head"><span>CAPITAL STRUCTURE</span><b>交互式投资结构</b></div><div class="sunburst-toolbar"><button id="sunburst-back" class="ghost-btn">← 返回上一级</button><span id="sunburst-path">集团投资结构</span></div><div class="sunburst-chart-head"><b id="sunburst-title">当前企业投资结构</b><span id="sunburst-subtitle">内环：产业板块 · 外环：投资项目 · 单位：亿元</span></div><svg id="sunburst-svg" viewBox="0 0 820 720"></svg><div id="sunburst-caption" class="sunburst-caption"></div></article>
+        <article class="panel hud-frame investment-detail"><div class="panel-head"><span>CURRENT ENTITY</span><b>当前企业投资雷达</b></div><div id="investment-kpis" class="investment-kpis"></div><canvas id="investment-project-chart"></canvas><div id="investment-project-list" class="investment-project-list"></div></article>
+      </div>
+    </section>
+
+    <section class="scene-page" data-scene="twin">
+      <div class="twin-grid">
+        <article class="panel hud-frame twin-canvas-panel"><div class="panel-head"><span>DIGITAL TWIN NETWORK</span><b>集团企业数字孪生数据流</b></div><svg id="twin-svg" viewBox="0 0 1400 760"></svg><div class="twin-footer"><span id="twin-status">DATA STREAM ACTIVE</span><span>INGEST <b id="ingest-rate">--</b>/s</span><span>AI <b id="ai-rate">--</b> ms</span></div></article>
+        <article class="panel hud-frame twin-side"><div class="panel-head"><span>TWIN DOMAINS</span><b>数字孪生域</b></div><div id="twin-domain-cards" class="twin-domain-cards"></div></article>
+      </div>
+    </section>
+
+    <section class="scene-page" data-scene="monitor">
+      <div class="monitor-grid">
+        <article class="panel hud-frame monitor-wheel-panel"><div class="panel-head"><span>AI MONITOR</span><b>持续智能扫描</b></div><div class="monitor-core-wrap"><svg id="monitor-wheel" viewBox="0 0 900 700"></svg><div class="monitor-readout"><strong id="monitor-progress">00%</strong><span id="monitor-state">SCANNING</span><p id="monitor-message">AI 正在建立企业监控上下文</p></div></div></article>
+        <article class="panel hud-frame monitor-rules"><div class="panel-head"><span>MONITOR RULES</span><b>预设监测规则</b></div><div id="rules-list" class="rules-list"></div><button id="demo-alert-btn" class="action-btn danger">触发演示预警</button></article>
+        <article class="panel hud-frame event-panel"><div class="panel-head"><span>EVENT STREAM</span><b>AI事件中心</b></div><div id="event-list" class="event-list"></div></article>
+      </div>
+    </section>
+
+    <section class="scene-page" data-scene="decision">
+      <div class="decision-grid-v4">
+        <article class="panel hud-frame decision-engine"><div class="panel-head"><span>AI DECISION ENGINE</span><b>AI 决策引擎</b></div><div class="decision-core"><div class="core-ring r1"></div><div class="core-ring r2"></div><div class="core-ring r3"></div><div class="core-center"><b>AI</b><span id="decision-core-state">READY</span></div><div id="decision-packets"></div></div><div id="diagnostic-timeline" class="diagnostic-timeline"></div></article>
+        <article class="panel hud-frame causal-panel"><div class="panel-head"><span>CAUSAL GRAPH</span><b>原因关系图</b></div><svg id="causal-svg" viewBox="0 0 1000 650"></svg><div id="diagnosis-summary" class="diagnosis-summary">等待 AI 决策分析。</div></article>
+        <article class="panel hud-frame option-panel"><div class="panel-head"><span>DECISION OPTIONS</span><b>方案生成与选择</b></div><div id="option-cards" class="option-cards"><div class="option-placeholder">点击下方按钮启动 AI 决策分析</div></div><div class="simulation-box"><div><span>MONTE CARLO SIMULATION</span><b id="sim-counter">0 / 5000</b></div><div id="simulation-bars" class="simulation-bars"></div></div><div class="decision-actions"><button id="run-decision" class="action-btn">启动 AI 决策分析</button><button id="simulate-options" class="ghost-btn" disabled>重新仿真</button></div></article>
+      </div>
+    </section>
+
+    <section class="scene-page" data-scene="metrics">
+      <div class="metric-panorama-grid">
+        <article class="panel hud-frame metric-tree-panel"><div class="panel-head"><span>METRIC SYSTEM</span><b>指标体系</b></div><input id="metric-search" class="search-input" placeholder="搜索指标"><div id="metric-tree" class="metric-tree"></div></article>
+        <article class="panel hud-frame metric-detail-panel"><div class="panel-head"><span>METRIC DETAIL</span><b id="metric-detail-title">指标全景</b></div><div id="metric-primary-kpis" class="metric-primary-kpis"></div><div class="forecast-toggle-row"><button id="metric-forecast-toggle" class="ghost-btn">AI预测：开启</button><span id="metric-forecast-confidence"></span></div><canvas id="metric-history-chart"></canvas><div id="metric-narrative" class="metric-narrative"></div></article>
+        <article class="panel hud-frame metric-compare-panel"><div class="panel-head"><span>COMPANY COMPARISON</span><b>企业横向比较</b></div><div id="metric-compare-list" class="metric-compare-list"></div></article>
+        <article class="panel hud-frame honeycomb-panel"><div class="panel-head"><span>ENTERPRISE HONEYCOMB</span><b>全集团指标蜂巢分布</b></div><svg id="metric-honeycomb" viewBox="0 0 1500 420"></svg></article>
+      </div>
+    </section>
+  </main>
+
+  <footer class="live-ticker hud-frame"><div><i id="sse-dot"></i><span id="sse-status">CONNECTING</span></div><div id="ticker-content">集团 AI 数字孪生系统正在建立实时连接...</div><button id="assistant-mini" class="assistant-mini"><span>AI</span><em>READY</em></button></footer>
+
+  <aside id="assistant-drawer" class="assistant-drawer" aria-hidden="true"><div class="assistant-head"><div><span>AI COMMAND ASSISTANT</span><b>集团作战室智能助手</b></div><button id="assistant-close" class="icon-btn">×</button></div><div class="assistant-wave" id="assistant-wave"></div><div id="assistant-log" class="assistant-log"><p>可以输入：“分析上海分公司最近利润为什么下降”</p></div><div class="assistant-input-row"><button id="voice-btn" class="voice-btn">🎙</button><input id="assistant-input" placeholder="输入自然语言指令"><button id="assistant-send" class="action-btn">执行</button></div></aside>
+
+  <div id="company-picker" class="modal-backdrop" aria-hidden="true"><div class="modal-card company-picker-card"><div class="modal-head"><div><span>ENTITY SELECTOR</span><b>搜索 / 切换企业</b></div><button class="modal-close">×</button></div><input id="company-picker-search" class="search-input big" placeholder="输入企业名称、城市或区域"><div id="company-picker-list" class="company-picker-list"></div></div></div>
+
+  <div id="profile-modal" class="modal-backdrop" aria-hidden="true"><div class="modal-card profile-modal-card"><div class="modal-head"><div><span id="profile-modal-eyebrow">PROFILE ANALYSIS</span><b id="profile-modal-title">画像深度分析</b></div><button class="modal-close">×</button></div><div class="profile-modal-grid"><div class="profile-metric-selector" id="profile-metric-selector"></div><div class="profile-metric-main"><div id="profile-metric-kpis" class="metric-primary-kpis"></div><div class="forecast-toggle-row"><button id="profile-forecast-toggle" class="ghost-btn">AI预测：开启</button><span id="profile-forecast-confidence"></span></div><canvas id="profile-metric-chart"></canvas></div><div class="profile-honeycomb"><div class="subhead"><span>ENTERPRISE HONEYCOMB</span><b>系统内所有企业实际分布</b></div><svg id="profile-honeycomb-svg" viewBox="0 0 1200 420"></svg></div></div></div></div>
+
+  <div id="alert-overlay" class="alert-overlay" aria-hidden="true"><div class="alert-card"><div class="alert-scan"></div><span id="alert-level" class="alert-level">CRITICAL</span><h2 id="alert-title">AI 风险预警</h2><p id="alert-message"></p><div class="alert-stats"><div><span>企业</span><b id="alert-company">--</b></div><div><span>当前值</span><b id="alert-value">--</b></div><div><span>规则</span><b id="alert-threshold">--</b></div></div><div class="alert-actions"><button id="alert-analyze" class="action-btn danger">进入 AI 分析</button><button id="alert-later" class="ghost-btn">稍后处理</button></div></div></div>
+</div>
+<script src="/static/js/charts.js?v=4.6"></script><script src="/static/js/visuals.js?v=4.6"></script><script src="/static/js/voice.js?v=4.6"></script><script src="/static/js/warroom.js?v=4.6"></script>
+</body></html>

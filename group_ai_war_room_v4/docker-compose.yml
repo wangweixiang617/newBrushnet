@@ -1,0 +1,14 @@
+services:
+  warroom:
+    build: .
+    container_name: group-ai-war-room-v4
+    restart: unless-stopped
+    ports:
+      - "8050:8050"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8050
+      - GROUP_NAME=华辰控股集团
+      - AI_MODE=mock
+    volumes:
+      - ./data:/app/data
