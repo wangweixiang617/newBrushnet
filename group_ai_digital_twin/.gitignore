@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env.local
+data/demo.db
+.venv/
+.idea/
+.vscode/

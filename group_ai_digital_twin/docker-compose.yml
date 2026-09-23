@@ -1,0 +1,11 @@
+services:
+  twin:
+    build: .
+    container_name: group-ai-digital-twin
+    restart: unless-stopped
+    ports:
+      - "8050:8050"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
