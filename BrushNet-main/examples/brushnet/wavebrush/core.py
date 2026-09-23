@@ -599,6 +599,7 @@ class HostAwareFusionHead(nn.Module):
         self.host_proj = nn.Conv2d(host_channels, hidden_channels, 1, bias=False)
         self.wave_norm = nn.GroupNorm(groups, hidden_channels)
         self.host_norm = nn.GroupNorm(groups, hidden_channels)
+        # self.host_norm = nn.Identity()
         self.mix = nn.Conv2d(2 * hidden_channels, hidden_channels, 1)
         self.norm = nn.GroupNorm(groups, hidden_channels)
         self.local = nn.Conv2d(
