@@ -49,6 +49,15 @@ def add_wave_args(parser):
     parser.add_argument('--drop_interval', nargs=2, type=float)
     parser.add_argument('--gate_override', type=float)
     parser.add_argument('--wave_strength', type=float, default=1.)
+    parser.add_argument('--wave_band_gains', type=float, nargs=4, default=None,
+                        metavar=('H1','H2','H3','L3'),
+                        help='Runtime multipliers for H1 H2 H3 L3; multiplied with the learned Wave gate')
+    parser.add_argument('--wave_stage_gains', type=float, nargs=5, default=None,
+                        metavar=('S0','S1','S2','S3','MID'),
+                        help='Runtime multipliers for the five active Sparse5 stages in active-slot order')
+    parser.add_argument('--wave_time_gains', type=float, nargs=10, default=None,
+                        metavar=('T0','T1','T2','T3','T4','T5','T6','T7','T8','T9'),
+                        help='Runtime multipliers for 10 diffusion-timestep bins: 0-99 ... 900-999')
     parser.add_argument('--wave_log_every', type=int, default=10)
 
     # Residual-envelope regularization. All three terms are independently switchable by weight.
@@ -183,6 +192,9 @@ def build_wave(brushnet, args, device, timesteps=1000, unet=None):
         drop_interval=args.drop_interval,
         gate_override=args.gate_override,
         wave_strength=args.wave_strength,
+        band_gains=args.wave_band_gains,
+        stage_gains=args.wave_stage_gains,
+        time_gains=args.wave_time_gains,
     )
     return wave
 
@@ -292,6 +304,7 @@ def wave_inference(brushnet,wave,images,masks,trace=None,unet=None,region_min_fr
                 t=float(torch.as_tensor(t).flatten()[0]),
                 gates=gates,
                 gate_summary=gate_summary(gate_tensor),
+                routing=wave.routing_snapshot(t),
                 residuals=residual_rows,
                 residual_summary=residual_summary(residual_rows),
                 branch_rms=projected_branch_rms,
@@ -455,6 +468,9 @@ def wave_input_stats(wave, image, hole):
         'drop_interval': cfg.get('drop_interval'),
         'gate_override': cfg.get('gate_override'),
         'wave_strength': cfg.get('wave_strength', 1.0),
+        'band_gains': cfg.get('band_gains', [1.0] * 4),
+        'stage_gains': cfg.get('stage_gains', [1.0] * 5),
+        'time_gains': cfg.get('time_gains', [1.0] * 10),
         'inject_mode': cfg.get('inject_mode', 'all'),
         'fusion_mode': cfg.get('fusion_mode', 'direct'),
         'inject_down_slots': cfg.get('inject_down_slots'),

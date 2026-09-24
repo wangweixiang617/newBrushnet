@@ -26,7 +26,7 @@ from torchmetrics.multimodal import CLIPScore
 # Set to False to recover the original full-mapping, single-pass behavior.
 ALIGN_TRAIN_VALIDATION_24X2 = True
 TRAIN_VALIDATION_COUNT = 24
-TRAIN_VALIDATION_REPEATS = 2
+TRAIN_VALIDATION_REPEATS = 1
 # This run was trained/validated in bf16; change only if the training validation precision changes.
 TRAIN_VALIDATION_DTYPE = torch.bfloat16
 
@@ -156,6 +156,12 @@ parser.add_argument('--drop_scales', nargs='*', type=int, choices=[0,1,2,3], def
 parser.add_argument('--drop_interval', nargs=2, type=float)
 parser.add_argument('--gate_override', type=float)
 parser.add_argument('--wave_strength', type=float, default=1.)
+parser.add_argument('--wave_band_gains', type=float, nargs=4, default=None,
+                    metavar=('H1','H2','H3','L3'))
+parser.add_argument('--wave_stage_gains', type=float, nargs=5, default=None,
+                    metavar=('S0','S1','S2','S3','MID'))
+parser.add_argument('--wave_time_gains', type=float, nargs=10, default=None,
+                    metavar=('T0','T1','T2','T3','T4','T5','T6','T7','T8','T9'))
 parser.add_argument('--trace_wave', action='store_true')
 parser.add_argument('--overwrite', action='store_true', help='Regenerate images in this experiment directory')
 args = parser.parse_args()
@@ -177,9 +183,13 @@ if wave is not None:
         drop_interval=args.drop_interval,
         gate_override=args.gate_override,
         wave_strength=args.wave_strength,
+        band_gains=args.wave_band_gains,
+        stage_gains=args.wave_stage_gains,
+        time_gains=args.wave_time_gains,
     )
 
 eval_dtype = TRAIN_VALIDATION_DTYPE if ALIGN_TRAIN_VALIDATION_24X2 else torch.float16
+eval_dtype = TRAIN_VALIDATION_DTYPE
 brushnet = BrushNetModel.from_pretrained(brushnet_path, torch_dtype=eval_dtype).to(device)
 pipe = StableDiffusionBrushNetPipeline.from_pretrained(
     base_model_path,
@@ -256,7 +266,9 @@ if ALIGN_TRAIN_VALIDATION_24X2:
     torch.manual_seed(args.seed)
     shared_generator = torch.Generator(device=device).manual_seed(args.seed)
 else:
-    shared_generator = None
+    torch.manual_seed(args.seed)
+    shared_generator = torch.Generator(device=device).manual_seed(args.seed)
+    # shared_generator = None
 
 # Exact RNG alignment cannot be resumed from a partially generated 24x2 directory,
 # because skipped batches would not consume the same RNG stream. Full cache is safe.

@@ -19,6 +19,18 @@ brushnet_path = "data/ckpt/segmentation_mask_brushnet_ckpt"
 wave_path = brushnet_path + "/wave"
 wave = WaveConditioner.from_pretrained(wave_path, "cuda").eval() if wave_path else None
 
+# Runtime Band x Stage x Time routing. Edit these three arrays for a single quick test.
+wave_band_gains = [1.0, 1.0, 1.0, 1.0]  # H1, H2, H3, L3
+wave_stage_gains = [1.0, 1.0, 1.0, 1.0, 1.0]  # S0, S1, S2, S3, Mid
+wave_time_gains = [1.0] * 10  # t=0-99, 100-199, ..., 900-999
+if wave is not None:
+    wave.set_interventions(
+        wave_strength=wave.config.get("wave_strength", 1.0),
+        band_gains=wave_band_gains,
+        stage_gains=wave_stage_gains,
+        time_gains=wave_time_gains,
+    )
+
 # choose whether using blended operation
 blended = False
 

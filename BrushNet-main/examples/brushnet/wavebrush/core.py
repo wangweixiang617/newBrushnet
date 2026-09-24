@@ -97,7 +97,7 @@ def merge_residuals(base, additions, strength=1.):
     for x, y in zip(samples, additions):
         if x.shape != y.shape:
             raise ValueError(f'Residual shape mismatch: {x.shape} vs {y.shape}')
-        out.append(x + strength*y.to(x.dtype))
+        out.append(x + strength * y.to(x.dtype))
     return list(out[:nd]), out[nd], list(out[nd+1:])
 
 
@@ -658,7 +658,7 @@ class WaveConditioner(nn.Module):
                  cross_attention_heads=8, drop_bands=None, drop_scales=None, drop_interval=None,
                  gate_override=None, wave_strength=1., temb_channels=None, inject_mode='all',
                  inject_down_slots=None, active_slot_indices=None, topology_signature=None,
-                 fusion_mode='direct'):
+                 fusion_mode='direct', band_gains=None, stage_gains=None, time_gains=None):
         super().__init__()
         if reliability not in ('none', 'concat', 'premul', 'soft'):
             raise ValueError('Unknown reliability mode')
@@ -766,10 +766,14 @@ class WaveConditioner(nn.Module):
             drop_interval=drop_interval,
             gate_override=gate_override,
             wave_strength=wave_strength,
+            band_gains=band_gains,
+            stage_gains=stage_gains,
+            time_gains=time_gains,
         )
 
     def set_interventions(self, drop_bands=None, drop_scales=None, drop_interval=None,
-                          gate_override=None, wave_strength=1.):
+                          gate_override=None, wave_strength=1., band_gains=None,
+                          stage_gains=None, time_gains=None):
         """Configure band/scale/time interventions and persist a JSON-safe canonical form.
 
         `drop_bands` is stored by band name in config but converted to integer indices at runtime.
@@ -812,11 +816,31 @@ class WaveConditioner(nn.Module):
         if not math.isfinite(wave_strength) or wave_strength < 0:
             raise ValueError('wave_strength must be finite and >= 0')
 
+        def _gain_vector(values, length, name):
+            values = [1.0] * length if values is None else [float(v) for v in values]
+            if len(values) != length:
+                raise ValueError(f'{name} must contain exactly {length} values')
+            if any((not math.isfinite(v)) or v < 0 for v in values):
+                raise ValueError(f'{name} values must be finite and >= 0')
+            return values
+
+        band_gains = _gain_vector(band_gains, 4, 'band_gains')
+        stage_gains = _gain_vector(stage_gains, 5, 'stage_gains')
+        time_gains = _gain_vector(time_gains, 10, 'time_gains')
+        if len(self.active_slot_indices) != 5 and any(abs(v - 1.0) > 1e-12 for v in stage_gains):
+            raise ValueError(
+                'Non-unit stage_gains require exactly five active Wave slots '
+                '(use stage_exit_mid or sparse5_custom)'
+            )
+
         self.drop_bands = {BANDS.index(name) for name in drop_bands}
         self.drop_scales = set(drop_scales)
         self.drop_interval = None if drop_interval is None else tuple(drop_interval)
         self.gate_override = gate_override
         self.strength = wave_strength
+        self.band_gains = tuple(band_gains)
+        self.stage_gains = tuple(stage_gains)
+        self.time_gains = tuple(time_gains)
 
         self.config.update({
             'drop_bands': drop_bands,
@@ -824,7 +848,49 @@ class WaveConditioner(nn.Module):
             'drop_interval': drop_interval,
             'gate_override': gate_override,
             'wave_strength': wave_strength,
+            'band_gains': band_gains,
+            'stage_gains': stage_gains,
+            'time_gains': time_gains,
         })
+
+    def _routing_time_bins(self, t):
+        t = torch.as_tensor(t)
+        # 10 bins in training-timestep coordinates:
+        # bin0=[0,0.1T), ..., bin9=[0.9T,T). Diffusion sampling runs high -> low t.
+        bins = torch.floor(t.float() * 10.0 / float(self.config['timesteps'])).long()
+        return bins.clamp_(0, 9)
+
+    def routing_multipliers(self, t):
+        """Return runtime Band x Stage x Time multipliers as [B, active_slots, 4].
+
+        These values multiply the learned legacy gate; they are runtime-only calibration
+        factors with fixed ordering H1/H2/H3/L3, active stage order, and 10 timestep bins.
+        """
+        t = torch.as_tensor(t, device=self.band_rms.device).reshape(-1)
+        band = torch.as_tensor(self.band_gains, device=t.device, dtype=torch.float32)
+        time = torch.as_tensor(self.time_gains, device=t.device, dtype=torch.float32)
+        bins = self._routing_time_bins(t)
+        time_value = time.index_select(0, bins)
+        if len(self.active_slot_indices) == 5:
+            stage = torch.as_tensor(self.stage_gains, device=t.device, dtype=torch.float32)
+        else:
+            stage = torch.ones(len(self.active_slot_indices), device=t.device, dtype=torch.float32)
+        return time_value[:, None, None] * stage[None, :, None] * band[None, None, :]
+
+    def routing_snapshot(self, t):
+        """JSON-friendly runtime routing information for tracing/debugging."""
+        t = torch.as_tensor(t, device=self.band_rms.device).reshape(-1)
+        if t.numel() == 0:
+            return {}
+        multipliers = self.routing_multipliers(t).detach().float().cpu()
+        bins = self._routing_time_bins(t).detach().cpu()
+        return {
+            'band_gains': list(self.band_gains),
+            'stage_gains': list(self.stage_gains),
+            'time_gains': list(self.time_gains),
+            'time_bins': bins.tolist(),
+            'multipliers': multipliers.tolist(),
+        }
 
     def _apply(self, fn):
         super()._apply(fn)
@@ -927,10 +993,7 @@ class WaveConditioner(nn.Module):
         if len(t) != batch:
             raise ValueError('Timestep batch mismatch')
         g = self.effective_gates(t)
-        fused = [
-            torch.cat([features[b][s] * g[:, b, s, None, None, None].to(features[b][s].dtype) for b in range(4)], 1)
-            for s in range(4)
-        ]
+        routing = self.routing_multipliers(t).to(device=g.device, dtype=g.dtype)
 
         fusion_mode = self.config.get('fusion_mode', 'direct')
         if fusion_mode == 'host_concat':
@@ -946,11 +1009,19 @@ class WaveConditioner(nn.Module):
         outputs = []
         for i, slot in enumerate(self.spec['slots']):
             scale = slot['scale']
-            x = fused[scale]
             zero_index = self.slot_to_zero_index.get(i)
+            ref = features[0][scale]
             if zero_index is None:
-                outputs.append(x.new_zeros((batch, slot['channels'], x.shape[-2], x.shape[-1])))
+                outputs.append(ref.new_zeros((batch, slot['channels'], ref.shape[-2], ref.shape[-1])))
                 continue
+
+            # Simple runtime routing: learned legacy gate * band gain * stage gain * time-bin gain.
+            x = torch.cat([
+                features[b][scale]
+                * g[:, b, scale, None, None, None].to(features[b][scale].dtype)
+                * routing[:, zero_index, b, None, None, None].to(features[b][scale].dtype)
+                for b in range(4)
+            ], 1)
 
             if fusion_mode == 'host_concat':
                 host = host_residuals[i]
@@ -983,14 +1054,19 @@ class WaveConditioner(nn.Module):
         if t.numel() == 1:
             t = t.expand(batch)
         g = self.effective_gates(t)
+        routing = self.routing_multipliers(t).to(device=g.device, dtype=g.dtype)
         rows = [[0.0, 0.0, 0.0, 0.0] for _ in self.spec['slots']]
-        for slot_index, layer in zip(self.active_slot_indices, self.zero):
+        for zero_index, (slot_index, layer) in enumerate(zip(self.active_slot_indices, self.zero)):
             slot = self.spec['slots'][slot_index]
             scale = slot['scale']
             width = features[0][scale].shape[1]
             values = []
             for b in range(4):
-                x = features[b][scale] * g[:, b, scale, None, None, None].to(features[b][scale].dtype)
+                x = (
+                    features[b][scale]
+                    * g[:, b, scale, None, None, None].to(features[b][scale].dtype)
+                    * routing[:, zero_index, b, None, None, None].to(features[b][scale].dtype)
+                )
                 weight = layer.weight[:, b * width:(b + 1) * width]
                 z = self.strength * F.conv2d(x, weight)
                 values.append(float(z.float().square().mean().sqrt()))

@@ -45,6 +45,12 @@ def parser(evaluate=False):
     p.add_argument('--drop_interval', type=float, nargs=2)
     p.add_argument('--gate_override', type=float, help='Fixed scalar at inference, for intervention only')
     p.add_argument('--wave_strength', type=float, default=1.)
+    p.add_argument('--wave_band_gains', type=float, nargs=4, default=None,
+                   metavar=('H1','H2','H3','L3'))
+    p.add_argument('--wave_stage_gains', type=float, nargs=5, default=None,
+                   metavar=('S0','S1','S2','S3','MID'))
+    p.add_argument('--wave_time_gains', type=float, nargs=10, default=None,
+                   metavar=('T0','T1','T2','T3','T4','T5','T6','T7','T8','T9'))
     return p
 
 
@@ -133,6 +139,9 @@ def main(evaluate=False):
                 drop_interval=a.drop_interval,
                 gate_override=a.gate_override,
                 wave_strength=a.wave_strength,
+                band_gains=a.wave_band_gains,
+                stage_gains=a.wave_stage_gains,
+                time_gains=a.wave_time_gains,
             )
         parameters = inspect.signature(pipe.__call__).parameters
         scale_name = 'brushnet_conditioning_scale' if 'brushnet_conditioning_scale' in parameters else 'paintingnet_conditioning_scale'
