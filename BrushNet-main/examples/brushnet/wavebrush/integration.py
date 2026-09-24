@@ -58,6 +58,16 @@ def add_wave_args(parser):
     parser.add_argument('--wave_time_gains', type=float, nargs=10, default=None,
                         metavar=('T0','T1','T2','T3','T4','T5','T6','T7','T8','T9'),
                         help='Runtime multipliers for 10 diffusion-timestep bins: 0-99 ... 900-999')
+    parser.add_argument('--wave_band_time_gains', type=float, nargs=40, default=None,
+                        help=(
+                            'Runtime Band x Time matrix, flattened row-major as '
+                            'H1[T0..T9], H2[T0..T9], H3[T0..T9], L3[T0..T9]'
+                        ))
+    parser.add_argument('--wave_band_stage_gains', type=float, nargs=20, default=None,
+                        help=(
+                            'Runtime Band x Stage matrix, flattened row-major as '
+                            'H1[S0,S1,S2,S3,MID], ..., L3[S0,S1,S2,S3,MID]'
+                        ))
     parser.add_argument('--wave_log_every', type=int, default=10)
 
     # Residual-envelope regularization. All three terms are independently switchable by weight.
@@ -195,6 +205,8 @@ def build_wave(brushnet, args, device, timesteps=1000, unet=None):
         band_gains=args.wave_band_gains,
         stage_gains=args.wave_stage_gains,
         time_gains=args.wave_time_gains,
+        band_time_gains=args.wave_band_time_gains,
+        band_stage_gains=args.wave_band_stage_gains,
     )
     return wave
 
@@ -471,6 +483,8 @@ def wave_input_stats(wave, image, hole):
         'band_gains': cfg.get('band_gains', [1.0] * 4),
         'stage_gains': cfg.get('stage_gains', [1.0] * 5),
         'time_gains': cfg.get('time_gains', [1.0] * 10),
+        'band_time_gains': cfg.get('band_time_gains', [[1.0] * 10 for _ in range(4)]),
+        'band_stage_gains': cfg.get('band_stage_gains', [[1.0] * 5 for _ in range(4)]),
         'inject_mode': cfg.get('inject_mode', 'all'),
         'fusion_mode': cfg.get('fusion_mode', 'direct'),
         'inject_down_slots': cfg.get('inject_down_slots'),

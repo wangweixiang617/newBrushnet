@@ -24,7 +24,7 @@ from torchmetrics.multimodal import CLIPScore
 # When True, mirror the training-time validation sampling protocol:
 # first 24 validation items x 2 stochastic repeats = 48 metric samples.
 # Set to False to recover the original full-mapping, single-pass behavior.
-ALIGN_TRAIN_VALIDATION_24X2 = True
+ALIGN_TRAIN_VALIDATION_24X2 = False
 TRAIN_VALIDATION_COUNT = 24
 TRAIN_VALIDATION_REPEATS = 1
 # This run was trained/validated in bf16; change only if the training validation precision changes.
@@ -162,6 +162,10 @@ parser.add_argument('--wave_stage_gains', type=float, nargs=5, default=None,
                     metavar=('S0','S1','S2','S3','MID'))
 parser.add_argument('--wave_time_gains', type=float, nargs=10, default=None,
                     metavar=('T0','T1','T2','T3','T4','T5','T6','T7','T8','T9'))
+parser.add_argument('--wave_band_time_gains', type=float, nargs=40, default=None,
+                    help='Flattened 4x10 Band x Time matrix: H1 row, H2 row, H3 row, L3 row')
+parser.add_argument('--wave_band_stage_gains', type=float, nargs=20, default=None,
+                    help='Flattened 4x5 Band x Stage matrix: H1 row, H2 row, H3 row, L3 row')
 parser.add_argument('--trace_wave', action='store_true')
 parser.add_argument('--overwrite', action='store_true', help='Regenerate images in this experiment directory')
 args = parser.parse_args()
@@ -186,6 +190,8 @@ if wave is not None:
         band_gains=args.wave_band_gains,
         stage_gains=args.wave_stage_gains,
         time_gains=args.wave_time_gains,
+        band_time_gains=args.wave_band_time_gains,
+        band_stage_gains=args.wave_band_stage_gains,
     )
 
 eval_dtype = TRAIN_VALIDATION_DTYPE if ALIGN_TRAIN_VALIDATION_24X2 else torch.float16
