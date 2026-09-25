@@ -108,6 +108,67 @@ def _contains_option(args, option):
     return any(token == option or token.startswith(option + '=') for token in args)
 
 
+def _ordered_results(results):
+    """Keep BrushNet baseline first, then Wave trials by trial_id."""
+    return sorted(results, key=lambda r: (0 if r['is_baseline'] else 1, r['trial_id']))
+
+
+def _write_aggregate_files(out_root, results):
+    """Atomically refresh scan_results.json/csv from all completed trials.
+
+    Called after every completed trial so a long scan always has an up-to-date
+    aggregate file, even if the process is interrupted before the full sweep ends.
+    """
+    out_root = Path(out_root)
+    ordered = _ordered_results(results)
+
+    json_path = out_root / 'scan_results.json'
+    json_tmp = out_root / 'scan_results.json.tmp'
+    json_tmp.write_text(
+        json.dumps(ordered, indent=2, ensure_ascii=False), encoding='utf-8'
+    )
+    json_tmp.replace(json_path)
+
+    metric_names = sorted({k for r in ordered for k in r['metrics']})
+    csv_path = out_root / 'scan_results.csv'
+    csv_tmp = out_root / 'scan_results.csv.tmp'
+    fieldnames = [
+        'trial_id', 'trial_type', 'is_baseline', 'status', 'returncode',
+        'band_index', 'stage_index', 'time_index', 'band_time_index', 'band_stage_index',
+        'wave_strength_index', 'wave_strength',
+        'band_gains', 'stage_gains', 'time_gains', 'band_time_gains', 'band_stage_gains',
+        'output', *metric_names,
+    ]
+    with csv_tmp.open('w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in ordered:
+            row = {
+                'trial_id': r['trial_id'],
+                'trial_type': r['trial_type'],
+                'is_baseline': r['is_baseline'],
+                'status': r['status'],
+                'returncode': r['returncode'],
+                'band_index': r['band_index'],
+                'stage_index': r['stage_index'],
+                'time_index': r['time_index'],
+                'band_time_index': r['band_time_index'],
+                'band_stage_index': r['band_stage_index'],
+                'wave_strength_index': r['wave_strength_index'],
+                'wave_strength': r['wave_strength'],
+                'band_gains': '' if r['band_gains'] is None else json.dumps(r['band_gains']),
+                'stage_gains': '' if r['stage_gains'] is None else json.dumps(r['stage_gains']),
+                'time_gains': '' if r['time_gains'] is None else json.dumps(r['time_gains']),
+                'band_time_gains': '' if r['band_time_gains'] is None else json.dumps(r['band_time_gains']),
+                'band_stage_gains': '' if r['band_stage_gains'] is None else json.dumps(r['band_stage_gains']),
+                'output': r['output'],
+            }
+            row.update(r['metrics'])
+            writer.writerow(row)
+    csv_tmp.replace(csv_path)
+    return json_path, csv_path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -171,7 +232,7 @@ def main():
 
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
-    trials = []
+    wave_trials = []
     for bi, si, ti, bti, bsi, strength_item in itertools.product(
         range(len(band_sets)),
         range(len(stage_sets)),
@@ -184,7 +245,7 @@ def main():
         trial_id = f'b{bi:02d}_s{si:02d}_t{ti:02d}_bt{bti:02d}_bs{bsi:02d}'
         if strength is not None:
             trial_id += f'_a{ai:02d}_{_strength_tag(strength)}'
-        trials.append({
+        wave_trials.append({
             'trial_id': trial_id,
             'trial_type': 'wave',
             'is_baseline': False,
@@ -203,10 +264,11 @@ def main():
             'output': str(out_root / trial_id),
         })
 
-    num_wave_trials = len(trials)
+    num_wave_trials = len(wave_trials)
+    baseline_trial = None
     if include_baseline:
         baseline_id = 'baseline_brushnet'
-        trials.append({
+        baseline_trial = {
             'trial_id': baseline_id,
             'trial_type': 'baseline',
             'is_baseline': True,
@@ -223,7 +285,10 @@ def main():
             'band_time_gains': None,
             'band_stage_gains': None,
             'output': str(out_root / baseline_id),
-        })
+        }
+
+    # Keep baseline first in the manifest as well as in execution/results.
+    trials = ([baseline_trial] if baseline_trial is not None else []) + wave_trials
 
     manifest = {
         'config_path': str(config_path),
@@ -329,54 +394,54 @@ def main():
             gpu_queue.put(gpu)
 
     results = []
+    total_trials = len(trials)
+
+    def record_result(trial, rc, status, metrics):
+        results.append({**trial, 'returncode': rc, 'status': status, 'metrics': metrics})
+        _, csv_path = _write_aggregate_files(out_root, results)
+        print(
+            f'[UPDATE] aggregate refreshed: {csv_path} '
+            f'({len(results)}/{total_trials} completed)',
+            flush=True,
+        )
+
+    # Baseline is intentionally completed before any Wave job is submitted.
+    # This guarantees baseline_brushnet is the first actual evaluation and the
+    # first row available in scan_results.csv/json.
+    # if baseline_trial is not None:
+    #     print('[BASELINE] running BrushNet-only baseline before Wave sweep ...', flush=True)
+    #     trial_id, rc, status, metrics = run_trial(baseline_trial)
+    #     record_result(baseline_trial, rc, status, metrics)
+    #     print(f'[BASELINE] finished: {trial_id} ({status})', flush=True)
+
     with ThreadPoolExecutor(max_workers=len(gpus)) as executor:
-        futures = [executor.submit(run_trial, trial) for trial in trials]
+        futures = {}
+
+        # Baseline first: submit it before all Wave trials.
+        # It will immediately occupy one available GPU instead of waiting for
+        # the whole Wave sweep to finish.
+        if baseline_trial is not None:
+            print('[BASELINE] submitting BrushNet-only baseline first ...', flush=True,)
+            futures[executor.submit(run_trial, baseline_trial)] = baseline_trial
+
+        # Then submit all Wave routing trials.
+        for trial in wave_trials:
+            futures[executor.submit(run_trial, trial)] = trial
+
+        # Baseline and Wave trials now run concurrently.
+        # Whichever trial finishes first is immediately written to the aggregate files.
         for future in as_completed(futures):
+            trial = futures[future]
             trial_id, rc, status, metrics = future.result()
-            trial = next(t for t in trials if t['trial_id'] == trial_id)
-            results.append({**trial, 'returncode': rc, 'status': status, 'metrics': metrics})
+            if trial_id != trial['trial_id']:
+                raise RuntimeError(f'Worker returned trial_id={trial_id!r}, expected {trial["trial_id"]!r}')
+            record_result(trial, rc, status, metrics)
+            if trial.get('is_baseline', False):
+                print(f'[BASELINE] finished: {trial_id} ({status})', flush=True,)
 
-    results.sort(key=lambda r: (0 if r['is_baseline'] else 1, r['trial_id']))
-    (out_root / 'scan_results.json').write_text(
-        json.dumps(results, indent=2, ensure_ascii=False), encoding='utf-8'
-    )
-
-    metric_names = sorted({k for r in results for k in r['metrics']})
+    # record_result() already refreshed both aggregate files after every trial.
+    # Keep one final path variable only for the completion message below.
     csv_path = out_root / 'scan_results.csv'
-    fieldnames = [
-        'trial_id', 'trial_type', 'is_baseline', 'status', 'returncode',
-        'band_index', 'stage_index', 'time_index', 'band_time_index', 'band_stage_index',
-        'wave_strength_index', 'wave_strength',
-        'band_gains', 'stage_gains', 'time_gains', 'band_time_gains', 'band_stage_gains',
-        'output', *metric_names,
-    ]
-    with csv_path.open('w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in results:
-            row = {
-                'trial_id': r['trial_id'],
-                'trial_type': r['trial_type'],
-                'is_baseline': r['is_baseline'],
-                'status': r['status'],
-                'returncode': r['returncode'],
-                'band_index': r['band_index'],
-                'stage_index': r['stage_index'],
-                'time_index': r['time_index'],
-                'band_time_index': r['band_time_index'],
-                'band_stage_index': r['band_stage_index'],
-                'wave_strength_index': r['wave_strength_index'],
-                'wave_strength': r['wave_strength'],
-                'band_gains': '' if r['band_gains'] is None else json.dumps(r['band_gains']),
-                'stage_gains': '' if r['stage_gains'] is None else json.dumps(r['stage_gains']),
-                'time_gains': '' if r['time_gains'] is None else json.dumps(r['time_gains']),
-                'band_time_gains': '' if r['band_time_gains'] is None else json.dumps(r['band_time_gains']),
-                'band_stage_gains': '' if r['band_stage_gains'] is None else json.dumps(r['band_stage_gains']),
-                'output': r['output'],
-            }
-            row.update(r['metrics'])
-            writer.writerow(row)
-
     failures = [r for r in results if r['returncode'] != 0]
     print(f'[DONE] results: {csv_path}', flush=True)
     if failures:
